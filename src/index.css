@@ -758,3 +758,9 @@ textarea:focus {
   border-color: var(--ember);
   box-shadow: 0 0 0 3px var(--ember-soft);
 }
+
+.template-input {
+  width: 60px !important;
+  padding: 4px 8px !important;
+  text-align: center;
+}
