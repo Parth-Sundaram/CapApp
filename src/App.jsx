@@ -376,6 +376,7 @@ export default function App() {
   const [demoMode, setDemoMode] = useState(true);
   const [dragOverIndex, setDragOverIndex] = useState(null);
   const [jsonStatus, setJsonStatus] = useState({ kind: 'ok', message: 'valid · 14 teams' });
+  const [templateCount, setTemplateCount] = useState(14);
 
   // Helper: parse JSON and propagate updates. Called by the JSON editor's
   // onChange and by loadPreset. This lives in event-handler territory —
@@ -487,6 +488,19 @@ export default function App() {
   const loadPreset = (id) => {
     const preset = getDemoPreset(id);
     handleJsonInputChange(JSON.stringify(preset.data, null, 2), preset.data);
+  };
+
+  const handleGenerateTemplate = () => {
+    const n = projectNames.length;
+    const blankRanking = Array.from({ length: n }, (_, i) => i + 1);
+    
+    const template = {};
+    for (let i = 1; i <= templateCount; i++) {
+      const teamName = `Team_${String(i).padStart(2, '0')}`;
+      template[teamName] = [...blankRanking];
+    }
+    
+    handleJsonInputChange(JSON.stringify(template, null, 2), template);
   };
 
   const runAnalysis = () => {
@@ -606,13 +620,20 @@ export default function App() {
           <button className="btn btn-secondary btn-sm" onClick={() => loadPreset('catastrophe')}>Demo: Catastrophe</button>
         </div>
 
-        <p className="label">JSON Input</p>
-        <JsonEditor
-          value={jsonInput}
-          onChange={handleJsonInputChange}
-          minRows={6}
-          placeholder={`{\n  "Team_01": [3, 1, 2, 5, 4, ...],\n  "Team_02": [2, 5, 1, ...]\n}`}
-        />
+        <div className="flex justify-between items-end mb-2 mt-4">
+          <p className="label" style={{ margin: 0 }}>JSON Input</p>
+          <div className="flex gap-2 items-center text-fog" style={{ fontSize: '0.85rem' }}>
+            Template for: 
+            <input 
+              type="number" 
+              className="template-input"
+              value={templateCount} 
+              onChange={(e) => setTemplateCount(Math.max(1, Number(e.target.value)))}
+            />
+            teams
+            <button className="btn btn-secondary btn-sm" onClick={handleGenerateTemplate}>Generate</button>
+          </div>
+        </div>
         <div className="flex justify-between items-center mt-2">
           <span className="text-fog mono" style={{ fontSize: '0.78rem' }}>
             {Object.keys(publicRankings).length} teams · auto-parsed on edit
