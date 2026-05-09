@@ -634,6 +634,14 @@ export default function App() {
             <button className="btn btn-secondary btn-sm" onClick={handleGenerateTemplate}>Generate</button>
           </div>
         </div>
+
+        <JsonEditor
+          value={jsonInput}
+          onChange={handleJsonInputChange}
+          minRows={6}
+          placeholder={`{\n  "Team_01": [3, 1, 2, 5, 4, ...],\n  "Team_02": [2, 5, 1, ...]\n}`}
+        />
+        
         <div className="flex justify-between items-center mt-2">
           <span className="text-fog mono" style={{ fontSize: '0.78rem' }}>
             {Object.keys(publicRankings).length} teams · auto-parsed on edit
