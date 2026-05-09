@@ -101,8 +101,11 @@ function simulate(myRanking, oppData, teamNames, myTeamName) {
 }
 
 function utility(projIdx, truePref, aiSet) {
+  // Base score is your exact list ranking (0 is best, 1 is second best, etc.)
   const base = truePref.indexOf(projIdx);
-  return aiSet.has(projIdx) ? base : base + 1000;
+  // Subtract a tiny fraction for AI projects.
+  // It gives a micro-bonus to AI, but NEVER enough to jump a full rank.
+  return aiSet.has(projIdx) ? base - 0.1 : base;
 }
 
 function makeHonest(truePref) {
