@@ -361,7 +361,7 @@ export default function App() {
   const myTeamName = 'MY_TEAM';
 
   const [projectNames, setProjectNames] = useState([...DEMO_PROJECT_LIST]);
-  const [teamNames] = useState([...DEMO_TEAM_LIST]);
+  const [teamNames, setTeamNames] = useState([...DEMO_TEAM_LIST]);
   const [myTruePref, setMyTruePref] = useState([...DEMO_TRUE_PREF]);
   const [aiProjectIndices, setAiProjectIndices] = useState(new Set(DEMO_AI_INDICES));
   const [publicRankings, setPublicRankings] = useState(() => getDemoPreset('baseline').data);
@@ -418,6 +418,14 @@ export default function App() {
       const extra = [];
       for (let i = 0; i < detectedN; i++) if (!current.has(i)) extra.push(i);
       return [...prev, ...extra];
+    });
+
+    setTeamNames((prev) => {
+      const jsonTeams = Object.keys(parsed);
+      if (!jsonTeams.includes(myTeamName)) {
+        return [...jsonTeams, myTeamName];
+      }
+      return jsonTeams;
     });
 
     setPublicRankings((prev) => {
