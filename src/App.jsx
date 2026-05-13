@@ -750,6 +750,33 @@ export default function App() {
             <p style={{ margin: "8px 0 0", maxWidth: 720 }}>{result.reason}</p>
             {result.missingTeams.length > 0 && <p className="text-fog" style={{ marginTop: 8, fontSize: "0.85rem" }}>Missing teams: {result.missingTeams.join(", ")}</p>}
           </div>
+
+          <div className="card mt-4">
+          <h2>Your Submission Order</h2>
+          <p className="label">Rank projects in Moodle in this exact order:</p>
+          <div className="code-block" style={{ maxHeight: '400px', overflowY: 'auto' }}>
+            <ol style={{ paddingLeft: '20px' }}>
+              {(() => {
+                const ranking = result.submit === "hc" ? result.hcRanking : result.honestRanking;
+                const projectIndices = Array.from({ length: projectNames.length }, (_, i) => i);
+                const sortedIndices = projectIndices.sort((a, b) => ranking[a] - ranking[b]);
+                
+                return sortedIndices.map((projIdx) => {
+                  let displayId = projIdx + 1;
+                  if (projIdx >= 20) displayId += 1; // Skip ID 21
+                  if (projIdx >= 31) displayId += 1; // Skip ID 33
+                  return (
+                    <li key={projIdx} style={{ marginBottom: '4px', fontFamily: 'mono' }}>
+                      {projectNames[projIdx]} 
+                      <span style={{ color: 'var(--fog)', fontSize: '0.8rem' }}> (ID: {displayId})</span>
+                    </li>
+                  );
+                });
+              })()}
+            </ol>
+          </div>
+        </div>
+
           <div className="result-grid">
             <div className="result-card">
               <h4>Honest Outcome</h4>
