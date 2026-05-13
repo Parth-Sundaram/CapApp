@@ -105,15 +105,23 @@ function linearSumAssignment(costMatrix) {
 
 // ==================== SIMULATION ====================
 function simulate(myRanking, oppData, teamNames, myTeamName) {
-  const matrix = teamNames.map((team) => {
+  const matrix = teamNames.map((team, idx) => {
     if (team === myTeamName) return [...myRanking];
-    if (!oppData[team]) return null;
-    return [...oppData[team]];
+
+    // Fallback logic: check the hardcoded name, then the watcher name
+    const anonName = `Anonymous_${idx + 1}`;
+    const data = oppData[team] || oppData[anonName];
+
+    if (!data) return null;
+    return [...data];
   });
+
   if (matrix.some((r) => r === null)) return -1;
+
   const [rowInd, colInd] = linearSumAssignment(matrix.map((r) => r.map(Number)));
   const assignment = {};
   rowInd.forEach((r, idx) => { assignment[r] = colInd[idx]; });
+  
   return assignment[teamNames.indexOf(myTeamName)];
 }
 function utility(projIdx, truePref, aiSet) {
@@ -172,63 +180,145 @@ function injectNoise(oppData, numNoisy, numSwaps, rng, teamNames, myTeamName, mi
   });
   return noisy;
 }
-function robustnessCheck({ myTruePreferences, publicRankings, aiProjectIndices, teamNames, projectNames, myTeamName = "MY_TEAM", noiseTrials = 100, seed = null, skipNoise = false }) {
+function robustnessCheck({ 
+  myTruePreferences, 
+  publicRankings, 
+  aiProjectIndices, 
+  teamNames, 
+  projectNames, 
+  myTeamName = "MY_TEAM", 
+  noiseTrials = 100, 
+  seed = null, 
+  skipNoise = false 
+}) {
   const n = myTruePreferences.length;
   const aiSet = new Set(aiProjectIndices);
   const otherTeams = teamNames.filter((t) => t !== myTeamName);
-  const missingTeams = otherTeams.filter((t) => !(t in publicRankings));
+
+  // 1. Correctly identify missing teams (neither "Team_X" nor "Anonymous_X" exists)
+  const missingTeams = otherTeams.filter((t, idx) => {
+    const anonName = `Anonymous_${idx + 1}`;
+    return !(t in publicRankings) && !(anonName in publicRankings);
+  });
+
   const projNames = projectNames || Array.from({ length: n }, (_, i) => `Proj_${String(i).padStart(2, "0")}`);
   const honestRanking = makeHonest(myTruePreferences);
   const rngClean = new SeededRandom(seed ?? 42);
-  const cleanData = { ...publicRankings };
-  missingTeams.forEach((team) => { cleanData[team] = rngClean.shuffle(Array.from({ length: n }, (_, i) => i + 1)); });
+
+  // 2. Prepare consolidated "cleanData" for simulation
+  // This maps everyone to their "Team_X" name for the matrix math
+  const cleanData = {};
+  otherTeams.forEach((team, idx) => {
+    const anonName = `Anonymous_${idx + 1}`;
+    const existingData = publicRankings[team] || publicRankings[anonName];
+    
+    if (existingData) {
+      cleanData[team] = [...existingData];
+    } else {
+      cleanData[team] = rngClean.shuffle(Array.from({ length: n }, (_, i) => i + 1));
+    }
+  });
+
   const hProjClean = simulate(honestRanking, cleanData, teamNames, myTeamName);
   const hScoreClean = utility(hProjClean, myTruePreferences, aiSet);
-  const [hcRanking, hcScoreClean] = hillClimb(publicRankings, myTruePreferences, aiSet, teamNames, myTeamName, 300, 5, missingTeams, seed);
+
+  // 3. Hill Climb based on the consolidated clean data
+  const [hcRanking, hcScoreClean] = hillClimb(cleanData, myTruePreferences, aiSet, teamNames, myTeamName, 300, 5, missingTeams, seed);
   const hcProjClean = simulate(hcRanking, cleanData, teamNames, myTeamName);
-  if (hcScoreClean >= hScoreClean) return { verdict: "SAFE", submit: "honest", honestRanking, hcRanking, reason: "HC found no improvement over honest. Nothing to risk.", missingTeams, projectNames: projNames, noiseResults: null, hProjClean, hcProjClean, noiseTrials, aiSet };
-  if (skipNoise) return { verdict: "SAFE", submit: "hc", honestRanking, hcRanking, reason: "Demo mode: HC improves on clean data. Skipped noise trials.", missingTeams, projectNames: projNames, noiseResults: null, hProjClean, hcProjClean, noiseTrials, aiSet };
+
+  if (hcScoreClean >= hScoreClean) {
+    return { verdict: "SAFE", submit: "honest", honestRanking, hcRanking, reason: "HC found no improvement over honest. Nothing to risk.", missingTeams, projectNames: projNames, noiseResults: null, hProjClean, hcProjClean, noiseTrials, aiSet };
+  }
+  
+  if (skipNoise) {
+    return { verdict: "SAFE", submit: "hc", honestRanking, hcRanking, reason: "Demo mode: HC improves on clean data. Skipped noise trials.", missingTeams, projectNames: projNames, noiseResults: null, hProjClean, hcProjClean, noiseTrials, aiSet };
+  }
+
+  // 4. Noise Trial Logic
   const numOpponents = teamNames.length - 1;
   const activeOpponents = Math.max(1, numOpponents - missingTeams.length);
   const cLight = Math.max(1, Math.round(activeOpponents * (1 / 14)));
   const cMed1 = Math.max(1, Math.round(activeOpponents * (2 / 14)));
   const cMed2 = Math.max(1, Math.round(activeOpponents * (3 / 14)));
   const cHeavy = Math.max(1, Math.round(activeOpponents * (5 / 14)));
-  const configs = [[cLight, 2, `Light (${cLight} team${cLight !== 1 ? "s" : ""}, 2 swaps)`], [cMed1, 4, `Medium (${cMed1} team${cMed1 !== 1 ? "s" : ""}, 4 swaps)`], [cMed2, 4, `Medium (${cMed2} team${cMed2 !== 1 ? "s" : ""}, 4 swaps)`], [cHeavy, 4, `Heavy (${cHeavy} team${cHeavy !== 1 ? "s" : ""}, 4 swaps)`], [cHeavy, 8, `Heavy (${cHeavy} team${cHeavy !== 1 ? "s" : ""}, 8 swaps)`]];
+
+  const configs = [
+    [cLight, 2, `Light (${cLight} team${cLight !== 1 ? "s" : ""}, 2 swaps)`],
+    [cMed1, 4, `Medium (${cMed1} team${cMed1 !== 1 ? "s" : ""}, 4 swaps)`],
+    [cMed2, 4, `Medium (${cMed2} team${cMed2 !== 1 ? "s" : ""}, 4 swaps)`],
+    [cHeavy, 4, `Heavy (${cHeavy} team${cHeavy !== 1 ? "s" : ""}, 4 swaps)`],
+    [cHeavy, 8, `Heavy (${cHeavy} team${cHeavy !== 1 ? "s" : ""}, 8 swaps)`]
+  ];
+
   const rng = new SeededRandom(seed ?? 42);
   const rows = [];
+
   for (const [numNoisy, numSwaps, label] of configs) {
     let hAi = 0, hcAi = 0, hcWins = 0, hWins = 0;
     const hPrefs = [], hcPrefs = [];
+    
     for (let t = 0; t < noiseTrials; t++) {
-      const noisy = injectNoise(publicRankings, numNoisy, numSwaps, rng, teamNames, myTeamName, missingTeams);
+      // We pass cleanData here so noise is injected into actual existing rankings
+      const noisy = injectNoise(cleanData, numNoisy, numSwaps, rng, teamNames, myTeamName, missingTeams);
+      
       const hp = simulate(honestRanking, noisy, teamNames, myTeamName);
       const hu = utility(hp, myTruePreferences, aiSet);
-      hPrefs.push(hu < 1000 ? hu : 99); if (aiSet.has(hp)) hAi++;
+      hPrefs.push(hu < 1000 ? hu : 99); 
+      if (aiSet.has(hp)) hAi++;
+
       const hcp = simulate(hcRanking, noisy, teamNames, myTeamName);
       const hcu = utility(hcp, myTruePreferences, aiSet);
-      hcPrefs.push(hcu < 1000 ? hcu : 99); if (aiSet.has(hcp)) hcAi++;
-      if (hu < hcu) hWins++; else if (hcu < hu) hcWins++;
+      hcPrefs.push(hcu < 1000 ? hcu : 99); 
+      if (aiSet.has(hcp)) hcAi++;
+
+      if (hu < hcu) hWins++; 
+      else if (hcu < hu) hcWins++;
     }
-    rows.push({ label, hAiPct: (hAi / noiseTrials) * 100, hcAiPct: (hcAi / noiseTrials) * 100, hMean: hPrefs.reduce((a, b) => a + b, 0) / hPrefs.length, hcMean: hcPrefs.reduce((a, b) => a + b, 0) / hcPrefs.length, hcWins, hWins, hcCatPct: ((noiseTrials - hcAi) / noiseTrials) * 100, hCatPct: ((noiseTrials - hAi) / noiseTrials) * 100 });
+    
+    rows.push({ 
+      label, 
+      hAiPct: (hAi / noiseTrials) * 100, 
+      hcAiPct: (hcAi / noiseTrials) * 100, 
+      hMean: hPrefs.reduce((a, b) => a + b, 0) / hPrefs.length, 
+      hcMean: hcPrefs.reduce((a, b) => a + b, 0) / hcPrefs.length, 
+      hcWins, 
+      hWins, 
+      hcCatPct: ((noiseTrials - hcAi) / noiseTrials) * 100, 
+      hCatPct: ((noiseTrials - hAi) / noiseTrials) * 100 
+    });
   }
+
+  // 5. Verdict Logic
   const realistic = rows[2], heavy = rows[4];
   const hcCatRealistic = realistic.hcCatPct, hCatRealistic = realistic.hCatPct, hcWinsRealistic = realistic.hcWins;
   let verdict, submit, reason;
+
   if (missingTeams.length) {
-    if (hcCatRealistic > 10) { verdict = "UNSAFE"; submit = "honest"; reason = `HC collapses under noise AND ${missingTeams.length} teams missing.`; }
-    else if (hcCatRealistic > hCatRealistic + 5) { verdict = "UNSAFE"; submit = "honest"; reason = `HC catastrophe rate (${hcCatRealistic.toFixed(0)}%) exceeds honest (${hCatRealistic.toFixed(0)}%) with missing teams.`; }
-    else if (hcWinsRealistic < noiseTrials * 0.4) { verdict = "RISKY"; submit = "honest"; reason = `HC wins only ${hcWinsRealistic}/${noiseTrials} under realistic noise. Conservative due to missing teams.`; }
-    else { verdict = "RISKY"; submit = "honest"; reason = `HC shows improvement but ${missingTeams.length} teams missing makes optimization unreliable.`; }
+    if (hcCatRealistic > 10) { 
+      verdict = "UNSAFE"; submit = "honest"; reason = `HC collapses under noise AND ${missingTeams.length} teams missing.`; 
+    } else if (hcCatRealistic > hCatRealistic + 5) { 
+      verdict = "UNSAFE"; submit = "honest"; reason = `HC catastrophe rate (${hcCatRealistic.toFixed(0)}%) exceeds honest (${hCatRealistic.toFixed(0)}%) with missing teams.`; 
+    } else if (hcWinsRealistic < noiseTrials * 0.4) { 
+      verdict = "RISKY"; submit = "honest"; reason = `HC wins only ${hcWinsRealistic}/${noiseTrials} under realistic noise. Conservative due to missing teams.`; 
+    } else { 
+      verdict = "RISKY"; submit = "honest"; reason = `HC shows improvement but ${missingTeams.length} teams missing makes optimization unreliable.`; 
+    }
   } else {
-    if (hcCatRealistic <= hCatRealistic + 5 && hcWinsRealistic >= noiseTrials * 0.5) { verdict = "SAFE"; submit = "hc"; reason = `HC improvement survives noise. Realistic noise: HC AI=${realistic.hcAiPct.toFixed(0)}% vs Honest AI=${realistic.hAiPct.toFixed(0)}%, HC wins ${hcWinsRealistic}/${noiseTrials}.`; }
-    else if (hcCatRealistic <= hCatRealistic + 15) { verdict = "RISKY"; submit = "honest"; reason = `HC improvement is fragile. Realistic noise: HC catastrophe=${hcCatRealistic.toFixed(0)}% vs Honest catastrophe=${hCatRealistic.toFixed(0)}%. Honest wins ${realistic.hWins}/${noiseTrials}.`; }
-    else { verdict = "UNSAFE"; submit = "honest"; reason = `HC ranking collapses under noise. Realistic noise: HC catastrophe=${hcCatRealistic.toFixed(0)}% vs Honest catastrophe=${hCatRealistic.toFixed(0)}%. Honest wins ${realistic.hWins}/${noiseTrials}.`; }
+    if (hcCatRealistic <= hCatRealistic + 5 && hcWinsRealistic >= noiseTrials * 0.5) { 
+      verdict = "SAFE"; submit = "hc"; reason = `HC improvement survives noise. Realistic noise: HC AI=${realistic.hcAiPct.toFixed(0)}% vs Honest AI=${realistic.hAiPct.toFixed(0)}%, HC wins ${hcWinsRealistic}/${noiseTrials}.`; 
+    } else if (hcCatRealistic <= hCatRealistic + 15) { 
+      verdict = "RISKY"; submit = "honest"; reason = `HC improvement is fragile. Realistic noise: HC catastrophe=${hcCatRealistic.toFixed(0)}% vs Honest catastrophe=${hCatRealistic.toFixed(0)}%. Honest wins ${realistic.hWins}/${noiseTrials}.`; 
+    } else { 
+      verdict = "UNSAFE"; submit = "honest"; reason = `HC ranking collapses under noise. Realistic noise: HC catastrophe=${hcCatRealistic.toFixed(0)}% vs Honest catastrophe=${hCatRealistic.toFixed(0)}%. Honest wins ${realistic.hWins}/${noiseTrials}.`; 
+    }
   }
-  if (heavy.hWins > noiseTrials * 0.7) { verdict = "UNSAFE"; submit = "honest"; reason = `HC collapses under heavy noise. Honest wins ${heavy.hWins}/${noiseTrials}. The improvement is a mirage from overfitting to perfect info.`; }
+
+  if (heavy.hWins > noiseTrials * 0.7) { 
+    verdict = "UNSAFE"; submit = "honest"; reason = `HC collapses under heavy noise. Honest wins ${heavy.hWins}/${noiseTrials}. The improvement is a mirage from overfitting to perfect info.`; 
+  }
+
   return { verdict, submit, honestRanking, hcRanking, reason, missingTeams, projectNames: projNames, noiseResults: rows, hProjClean, hcProjClean, noiseTrials, aiSet };
 }
-
 // ==================== DEFAULTS ====================
 const REAL_N_PROJECTS = 32;
 const REAL_N_TEAMS = 18;
@@ -555,11 +645,20 @@ export default function App() {
             <div className="tracker-progress-fill" style={{ width: totalOpp > 0 ? `${(enteredCount / totalOpp) * 100}%` : "0%" }} />
           </div>
           <div className="tracker-grid">
-            {otherTeams.map((team) => (
-              <div key={team} className={`tracker-pill ${publicRankings[team] ? "submitted" : "waiting"}`}>
-                <span className="tracker-dot" />{team}
-              </div>
-            ))}
+            {otherTeams.map((team, idx) => {
+              // Generate the name the watcher uses (Anonymous_1, Anonymous_2, etc.)
+              const anonName = `Anonymous_${idx + 1}`;
+              
+              // Light up the pill if either the manual name OR the anonymous name exists
+              const isSubmitted = !!(publicRankings[team] || publicRankings[anonName]);
+              
+              return (
+                <div key={team} className={`tracker-pill ${isSubmitted ? "submitted" : "waiting"}`}>
+                  <span className="tracker-dot" />
+                  {isSubmitted && publicRankings[anonName] ? anonName : team}
+                </div>
+              );
+            })}
           </div>
         </div>
         <div className="tab-bar">
