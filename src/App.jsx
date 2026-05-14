@@ -99,17 +99,7 @@ function linearSumAssignment(costMatrix) {
   return [rowInd, colInd];
 }
 
-// ==================== SIMULATION (identity-free) ====================
-// Instead of mapping by team name, we pass a flat array of opponent rankings.
-// `myRow` is the row position my team occupies in the cost matrix. This matters
-// because the Hungarian algorithm breaks ties by row order — putting me at row 0
-// gave me an artificial tiebreaker advantage that the real assignment process
-// won't replicate. Default `myRow = "last"` is conservative (ties go against me).
-//
-// myRanking: length-n permutation of 1..n
-// opponentRankings: array of length-n permutations
-// myRow: integer 0..opponentRankings.length, or "last" (default). Determines where
-//        in the cost matrix my row is inserted relative to the opponents.
+// ==================== SIMULATION ====================
 function simulate(myRanking, opponentRankings, myRow = "last") {
   const oppCount = opponentRankings.length;
   const myRowIdx = myRow === "last" ? oppCount : Math.max(0, Math.min(oppCount, myRow));
@@ -136,21 +126,12 @@ function makeHonest(truePref) {
   return r;
 }
 
-// Generate a uniform random permutation of 1..n
 function randomPermutation(n, rng) {
   return rng.shuffle(Array.from({ length: n }, (_, i) => i + 1));
 }
 
-// Generate a "clustered" ranking by sampling each project's rank from the
-// observed marginals across known rankings. Uses Plackett-Luce-style
-// sequential sampling so the result is still a valid permutation.
-//
-// For each project, build a weight vector over ranks 1..n based on how often
-// known teams placed it at each rank. Then sample rank assignments greedily,
-// breaking ties by sequential constraint satisfaction.
 function clusteredPermutation(n, knownRankings, rng) {
   if (knownRankings.length === 0) return randomPermutation(n, rng);
-  // For each project p, count how often known teams put it at each rank.
   const marginals = Array.from({ length: n }, () => new Array(n).fill(0));
   for (const ranking of knownRankings) {
     for (let p = 0; p < n; p++) {
@@ -158,12 +139,9 @@ function clusteredPermutation(n, knownRankings, rng) {
       if (r >= 1 && r <= n) marginals[p][r - 1] += 1;
     }
   }
-  // Add Laplace smoothing so unobserved ranks still have nonzero probability
   for (let p = 0; p < n; p++) {
     for (let r = 0; r < n; r++) marginals[p][r] += 0.5;
   }
-  // Greedy sampling: project order is randomized; for each project, sample a
-  // rank from its (renormalized) marginal restricted to unused ranks.
   const projOrder = rng.shuffle(Array.from({ length: n }, (_, i) => i));
   const result = new Array(n).fill(0);
   const usedRanks = new Set();
@@ -171,7 +149,6 @@ function clusteredPermutation(n, knownRankings, rng) {
     const weights = marginals[p].map((w, r) => usedRanks.has(r + 1) ? 0 : w);
     const total = weights.reduce((a, b) => a + b, 0);
     if (total <= 0) {
-      // Fallback: pick any unused rank uniformly
       const free = [];
       for (let r = 1; r <= n; r++) if (!usedRanks.has(r)) free.push(r);
       const pick = free[Math.floor(rng.random() * free.length)];
@@ -184,7 +161,7 @@ function clusteredPermutation(n, knownRankings, rng) {
         target -= weights[r];
         if (target <= 0) { pickedR = r + 1; break; }
       }
-      if (pickedR === -1) pickedR = n; // numerical safety
+      if (pickedR === -1) pickedR = n;
       result[p] = pickedR;
       usedRanks.add(pickedR);
     }
@@ -193,16 +170,11 @@ function clusteredPermutation(n, knownRankings, rng) {
 }
 
 // ==================== HILL CLIMB ====================
-// Now takes the array of known opponent rankings (frozen) plus an optional
-// "filler" function for unknown teams. The hill climb optimizes against the
-// EXPECTED outcome where unknown teams are filled with one fixed sample.
-// (We use the same fixed sample for HC training; the stress test re-samples.)
 function hillClimb(knownRankings, missingCount, myTruePref, aiSet, fillerFn, maxIter = 300, restarts = 5, seed = null) {
   const n = myTruePref.length;
   const rngLocal = new SeededRandom(seed ?? 42);
   const honest = makeHonest(myTruePref);
 
-  // Single fixed fill for HC training — so the search has a stable objective.
   const fixedFill = [];
   for (let i = 0; i < missingCount; i++) fixedFill.push(fillerFn(rngLocal));
   const trainingOpponents = [...knownRankings, ...fixedFill];
@@ -236,17 +208,10 @@ function hillClimb(knownRankings, missingCount, myTruePref, aiSet, fillerFn, max
 }
 
 // ==================== ROBUSTNESS CHECK ====================
-// New model: known opponent rankings are FROZEN (we have them from the
-// watcher). Only unknown teams are sampled per trial. Three scenarios:
-//   - Neutral: unknown teams = uniform random permutations
-//   - Clustered: unknown teams sampled from observed marginals (assumes
-//                preferences cluster around what we've seen)
-//   - Adversarial: per trial, sample K unknown configurations and keep the
-//                  worst outcome for me (models "opponents conspire against me")
 function robustnessCheck({
   myTruePreferences,
-  knownRankings, // array of length-n permutations, identity-free
-  totalOpponents, // total number of opponent teams (excluding MY_TEAM)
+  knownRankings,
+  totalOpponents,
   aiProjectIndices,
   projectNames,
   noiseTrials = 100,
@@ -260,8 +225,6 @@ function robustnessCheck({
   const projNames = projectNames || Array.from({ length: n }, (_, i) => `Proj_${String(i).padStart(2, "0")}`);
   const honestRanking = makeHonest(myTruePreferences);
 
-  // For "clean" comparison we need a representative scenario. Use neutral
-  // uniform fill. Both honest and HC are evaluated against this same fill.
   const rngClean = new SeededRandom(seed ?? 42);
   const cleanFill = [];
   for (let i = 0; i < missingCount; i++) cleanFill.push(randomPermutation(n, rngClean));
@@ -276,26 +239,89 @@ function robustnessCheck({
   );
   const hcProjClean = simulate(hcRanking, cleanOpponents);
 
+  // modal: most common outcome, tie-broken by best true-pref rank
+  function modal(outcomes) {
+    if (!outcomes || outcomes.length === 0) return null;
+    const counts = new Map();
+    for (const p of outcomes) counts.set(p, (counts.get(p) || 0) + 1);
+    let bestP = -1, bestC = -1, bestTruePref = Infinity;
+    for (const [p, c] of counts.entries()) {
+      const tp = myTruePreferences.indexOf(p);
+      if (c > bestC || (c === bestC && tp < bestTruePref)) {
+        bestP = p; bestC = c; bestTruePref = tp;
+      }
+    }
+    return { projIdx: bestP, count: bestC, total: outcomes.length, pct: (bestC / outcomes.length) * 100 };
+  }
+
+  // topNModal: top N most common outcomes ordered by frequency. Ties broken by
+  // better (lower) true-pref rank. Only includes outcomes that actually occurred.
+  function topNModal(outcomes, n) {
+    if (!outcomes || outcomes.length === 0) return [];
+    const counts = new Map();
+    for (const p of outcomes) counts.set(p, (counts.get(p) || 0) + 1);
+    const total = outcomes.length;
+    const entries = [];
+    for (const [p, c] of counts.entries()) {
+      entries.push({
+        projIdx: p, count: c, total, pct: (c / total) * 100,
+        truePref: myTruePreferences.indexOf(p),
+      });
+    }
+    entries.sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.truePref - b.truePref;
+    });
+    return entries.slice(0, n);
+  }
+
+  // worst: single worst true-pref outcome across all adversarial trials
+  function worst(outcomes) {
+    if (!outcomes || outcomes.length === 0) return null;
+    let worstP = -1, worstTruePref = -1;
+    for (const p of outcomes) {
+      const tp = myTruePreferences.indexOf(p);
+      if (tp > worstTruePref) { worstTruePref = tp; worstP = p; }
+    }
+    const count = outcomes.filter(p => p === worstP).length;
+    return { projIdx: worstP, count, total: outcomes.length, pct: (count / outcomes.length) * 100 };
+  }
+
   if (hcScoreClean >= hScoreClean) {
+    const deterministicModal = (projIdx) => ({ projIdx, count: 1, total: 1, pct: 100 });
+    const deterministicTop3 = (projIdx) => [{ projIdx, count: 1, total: 1, pct: 100, truePref: myTruePreferences.indexOf(projIdx) }];
+    const deterministicWorst = (projIdx) => ({ projIdx, countAdv: 1, totalAdv: 1, pctAdv: 100, countOverall: 1, totalOverall: 1, pctOverall: 100 });
     return {
       verdict: "SAFE", submit: "honest", honestRanking, hcRanking,
       reason: "HC found no improvement over honest. Nothing to risk.",
       knownCount: knownRankings.length, missingCount, projectNames: projNames,
       noiseResults: null, hProjClean, hcProjClean, noiseTrials, aiSet,
+      hMostLikely: deterministicModal(hProjClean),
+      hcMostLikely: deterministicModal(hcProjClean),
+      hWorstCase: deterministicWorst(hProjClean),
+      hcWorstCase: deterministicWorst(hcProjClean),
+      hTop3: deterministicTop3(hProjClean),
+      hcTop3: deterministicTop3(hcProjClean),
     };
   }
   if (skipNoise) {
+    const deterministicModal = (projIdx) => ({ projIdx, count: 1, total: 1, pct: 100 });
+    const deterministicTop3 = (projIdx) => [{ projIdx, count: 1, total: 1, pct: 100, truePref: myTruePreferences.indexOf(projIdx) }];
+    const deterministicWorst = (projIdx) => ({ projIdx, countAdv: 1, totalAdv: 1, pctAdv: 100, countOverall: 1, totalOverall: 1, pctOverall: 100 });
     return {
       verdict: "SAFE", submit: "hc", honestRanking, hcRanking,
       reason: "Demo mode: HC improves on clean data. Skipped stress trials.",
       knownCount: knownRankings.length, missingCount, projectNames: projNames,
       noiseResults: null, hProjClean, hcProjClean, noiseTrials, aiSet,
+      hMostLikely: deterministicModal(hProjClean),
+      hcMostLikely: deterministicModal(hcProjClean),
+      hWorstCase: deterministicWorst(hProjClean),
+      hcWorstCase: deterministicWorst(hcProjClean),
+      hTop3: deterministicTop3(hProjClean),
+      hcTop3: deterministicTop3(hcProjClean),
     };
   }
 
-  // Three scenarios for the unknown-teams fill. Each ships a `description`
-  // that's surfaced in the UI under the scenario label so you can see what's
-  // actually being tested.
   const scenarios = [
     {
       label: "Uniform random",
@@ -321,7 +347,6 @@ function robustnessCheck({
       label: "Targeted adversarial",
       key: "adversarial",
       description: `Every unknown team submits the SAME ranking you do, creating maximum contention for whatever you put at rank #1. Tests whether your ranking survives a worst-case world where unknowns specifically target your top picks.`,
-      // sampleTrial is unused for this scenario — handled specially below.
       sampleTrial: null,
     },
   ];
@@ -331,22 +356,15 @@ function robustnessCheck({
 
   for (const scenario of scenarios) {
     let hAi = 0, hcAi = 0, hcWins = 0, hWins = 0;
-    const hPrefs = [], hcPrefs = [];
+    const hPrefs = [], hcPrefs = []; // utility values (for verdict wins/aggregates)
+    const hRanks = [], hcRanks = []; // 1-indexed true-pref ranks (for median display)
+    const hOutcomes = [], hcOutcomes = [];
     for (let t = 0; t < noiseTrials; t++) {
-      // Pick a row position for MY_TEAM in this trial's cost matrix. Varying
-      // this across trials averages out the Hungarian algorithm's row-order
-      // tiebreaker bias — both honest and HC are evaluated at the SAME row
-      // for fair comparison within each trial, but row position itself shifts
-      // across trials.
       let hu, hcu, hp, hcp;
       const totalOppsThisTrial = knownRankings.length + missingCount;
       const myRowForTrial = Math.floor(rng.random() * (totalOppsThisTrial + 1));
 
       if (scenario.key === "adversarial") {
-        // Each unknown team submits the SAME ranking as the candidate being
-        // evaluated. For honest: unknowns mirror honest. For HC: unknowns mirror HC.
-        // This is the targeted worst case — maximum contention on whatever
-        // project the candidate puts at #1.
         const hOpps = [...knownRankings];
         const hcOpps = [...knownRankings];
         for (let i = 0; i < missingCount; i++) {
@@ -364,28 +382,69 @@ function robustnessCheck({
         hcp = simulate(hcRanking, opps, myRowForTrial);
         hcu = utility(hcp, myTruePreferences, aiSet);
       }
+      hOutcomes.push(hp);
+      hcOutcomes.push(hcp);
       hPrefs.push(hu < 1000 ? hu : 99); if (aiSet.has(hp)) hAi++;
       hcPrefs.push(hcu < 1000 ? hcu : 99); if (aiSet.has(hcp)) hcAi++;
+      // 1-indexed true-pref rank for clean display (no AI tiebreaker)
+      hRanks.push(myTruePreferences.indexOf(hp) + 1);
+      hcRanks.push(myTruePreferences.indexOf(hcp) + 1);
       if (hu < hcu) hWins++; else if (hcu < hu) hcWins++;
     }
+    // medians computed from the clean 1-indexed ranks, not utility values
+    const sortedHRanks = [...hRanks].sort((a, b) => a - b);
+    const sortedHcRanks = [...hcRanks].sort((a, b) => a - b);
+    const medianOf = (sorted) => {
+      const m = sorted.length;
+      if (m === 0) return 0;
+      return m % 2 === 1 ? sorted[(m - 1) / 2] : (sorted[m / 2 - 1] + sorted[m / 2]) / 2;
+    };
     rows.push({
       label: scenario.label,
       key: scenario.key,
       description: scenario.description,
       hAiPct: (hAi / noiseTrials) * 100, hcAiPct: (hcAi / noiseTrials) * 100,
-      hMean: hPrefs.reduce((a, b) => a + b, 0) / hPrefs.length,
-      hcMean: hcPrefs.reduce((a, b) => a + b, 0) / hcPrefs.length,
+      hMean: hRanks.reduce((a, b) => a + b, 0) / hRanks.length,
+      hcMean: hcRanks.reduce((a, b) => a + b, 0) / hcRanks.length,
+      hMedian: medianOf(sortedHRanks),
+      hcMedian: medianOf(sortedHcRanks),
       hcWins, hWins,
       hcCatPct: ((noiseTrials - hcAi) / noiseTrials) * 100,
       hCatPct: ((noiseTrials - hAi) / noiseTrials) * 100,
+      hOutcomes, hcOutcomes,
     });
   }
 
-  // Verdict logic — focus on neutral + clustered + adversarial.
-  // SAFE: HC wins or ties on all three scenarios (neutral, clustered) AND
-  //       doesn't catastrophically lose adversarial.
-  // RISKY: HC wins neutral but loses one of clustered/adversarial badly.
-  // UNSAFE: HC loses adversarial badly (>70% honest wins) OR loses neutral.
+  const allHonestOutcomes = rows.flatMap((r) => r.hOutcomes);
+  const allHcOutcomes = rows.flatMap((r) => r.hcOutcomes);
+  const adversarialRow = rows.find((r) => r.key === "adversarial");
+
+  const hMostLikely = modal(allHonestOutcomes);
+  const hcMostLikely = modal(allHcOutcomes);
+  // Top 3 most-likely outcomes pooled across all stress trials.
+  const hTop3 = topNModal(allHonestOutcomes, 3);
+  const hcTop3 = topNModal(allHcOutcomes, 3);
+  // Worst case: single worst true-pref project that appeared in adversarial trials.
+  // Report TWO percentages so readers see both the scenario rate and the overall rate:
+  //   - pctAdv:     % of adversarial trials where this project was the outcome
+  //   - pctOverall: % of all 300 trials (3 scenarios pooled)
+  function computeWorstCase(advOutcomes, allOutcomes) {
+    const w = worst(advOutcomes);
+    if (!w) return null;
+    const overallCount = allOutcomes.filter(p => p === w.projIdx).length;
+    return {
+      projIdx: w.projIdx,
+      countAdv: w.count,
+      totalAdv: w.total,
+      pctAdv: w.pct,
+      countOverall: overallCount,
+      totalOverall: allOutcomes.length,
+      pctOverall: (overallCount / allOutcomes.length) * 100,
+    };
+  }
+  const hWorstCase = adversarialRow ? computeWorstCase(adversarialRow.hOutcomes, allHonestOutcomes) : null;
+  const hcWorstCase = adversarialRow ? computeWorstCase(adversarialRow.hcOutcomes, allHcOutcomes) : null;
+
   const neutral = rows.find((r) => r.key === "neutral");
   const clustered = rows.find((r) => r.key === "clustered");
   const adversarial = rows.find((r) => r.key === "adversarial");
@@ -393,8 +452,8 @@ function robustnessCheck({
 
   const advHonestWins = adversarial.hWins;
   const advThreshold = noiseTrials * 0.6;
-  const neutralOK = neutral.hcWins >= noiseTrials * 0.45 || neutral.hcMean <= neutral.hMean;
-  const clusteredOK = clustered.hcWins >= noiseTrials * 0.45 || clustered.hcMean <= clustered.hMean;
+  const neutralOK = neutral.hcWins >= noiseTrials * 0.45 || neutral.hcMedian <= neutral.hMedian;
+  const clusteredOK = clustered.hcWins >= noiseTrials * 0.45 || clustered.hcMedian <= clustered.hMedian;
   const adversarialOK = advHonestWins < advThreshold;
 
   if (missingCount === 0) {
@@ -419,6 +478,8 @@ function robustnessCheck({
     knownCount: knownRankings.length, missingCount,
     projectNames: projNames, noiseResults: rows,
     hProjClean, hcProjClean, noiseTrials, aiSet,
+    hMostLikely, hcMostLikely, hWorstCase, hcWorstCase,
+    hTop3, hcTop3,
   };
 }
 
@@ -436,7 +497,7 @@ export default function App() {
   const [myTruePref, setMyTruePref] = useState([...DEFAULT_TRUE_PREF]);
   const [aiProjectIndices, setAiProjectIndices] = useState(new Set());
   const [publicRankings, setPublicRankings] = useState({});
-  const [totalTeams, setTotalTeams] = useState(DEFAULT_TOTAL_TEAMS); // includes MY_TEAM
+  const [totalTeams, setTotalTeams] = useState(DEFAULT_TOTAL_TEAMS);
   const [jsonInput, setJsonInput] = useState("{\n  \n}");
   const [noiseTrials, setNoiseTrials] = useState(100);
   const [seed, setSeed] = useState(42);
@@ -457,7 +518,6 @@ export default function App() {
   const [prefText, setPrefText] = useState("");
   const [prefError, setPrefError] = useState("");
 
-  // ── Load from Firestore on mount ──
   useEffect(() => {
     loadFromFirestore().then((data) => {
       if (data) {
@@ -479,7 +539,6 @@ export default function App() {
     }).catch(() => { setHydrated(true); setSyncStatus("error"); });
   }, []);
 
-  // ── Debounced Firestore save ──
   const debouncedSave = useDebouncedMerge(async (patch) => {
     setSyncStatus("saving");
     await saveToFirestore(patch);
@@ -504,7 +563,6 @@ export default function App() {
     debouncedSave({ publicRankings: newRankings });
   }, [debouncedSave]);
 
-  // ── JSON editor ──
   const handleJsonInputChange = useCallback((nextJson, nextParsedOverride) => {
     setJsonInput(nextJson);
     let parsed = nextParsedOverride;
@@ -540,7 +598,6 @@ export default function App() {
     setJsonStatus({ kind: "ok", message: `valid · ${keys.length} team${keys.length === 1 ? "" : "s"}` });
   };
 
-  // ── Manual entry ──
   const handleManualAdd = () => {
     setManualError("");
     const team = manualTeam.trim();
@@ -621,24 +678,11 @@ export default function App() {
     setImportText("");
   };
 
-  // ── True Preferences import ──
-  // Accepts the SAME semantic as opponent rankings: arr[projectIndex] = rank.
-  // Two input formats auto-detected:
-  //   - JSON array: [5, 1, 3, 2, ...] — value at index i is the rank for project i.
-  //                 0/null/missing entries mean "unranked, append to end."
-  //   - Line-based: "1: 5" or "1, 5" or "1 5" — meaning project ID 1 → rank 5.
-  //                 Multiple lines, any not mentioned are unranked.
-  // After parsing, we invert: build a myTruePref (preference-order array of
-  // project indices), using the ranks the user gave, then append unranked
-  // projects in their current order to fill remaining slots.
   const parsePreferenceInput = (text) => {
     const trimmed = text.trim();
     if (!trimmed) return { error: "Paste at least one entry." };
     const n = projectNames.length;
-    // ProjectIndex → rank map (1..n). Missing or 0 entries = unranked.
     const projToRank = {};
-
-    // Try JSON array first
     if (trimmed.startsWith("[")) {
       let arr;
       try { arr = JSON.parse(trimmed); }
@@ -655,11 +699,7 @@ export default function App() {
         projToRank[i] = rNum;
       }
     } else {
-      // Line-based: each line is "projectID separator rank" or just "rank"
-      // (when one-per-line and we infer position from line order).
       const lines = trimmed.split("\n").map((l) => l.trim()).filter(Boolean);
-      // Detect format: does every line have a separator?
-      const sep = /[:\-—,]\s*|\s+/;
       const looksPaired = lines.every((l) => /^\s*\d+\s*[:\-—,]\s*\d+\s*$/.test(l)) ||
                            lines.every((l) => /^\s*\d+\s+\d+\s*$/.test(l));
       if (looksPaired) {
@@ -668,19 +708,12 @@ export default function App() {
           if (!m) return { error: `Could not parse "${l}" as "ID: rank".` };
           const externalId = Number(m[1]);
           const rank = Number(m[2]);
-          // Find project by external ID — we don't store this directly, so we
-          // assume the user imported projects via "Import projects" which sorted
-          // them by external ID into indices 0..n-1. We let the user reference
-          // by 1..n (internal position) OR by external ID — try both.
-          // Since project names like "1: Type Safe LLM Library" embed the ID,
-          // we can sniff it from the name. Otherwise fall back to 1-based index.
           let projIdx = -1;
           for (let i = 0; i < projectNames.length; i++) {
             const m2 = projectNames[i].match(/^(\d+)\s*:/);
             if (m2 && Number(m2[1]) === externalId) { projIdx = i; break; }
           }
           if (projIdx === -1) {
-            // Maybe user meant 1-based internal position
             if (externalId >= 1 && externalId <= n) projIdx = externalId - 1;
           }
           if (projIdx === -1) return { error: `No project found for ID ${externalId}.` };
@@ -688,7 +721,6 @@ export default function App() {
           projToRank[projIdx] = rank;
         }
       } else {
-        // One value per line, taken in order: line k = rank for project index k
         if (lines.length > n) return { error: `${lines.length} entries; expected at most ${n}.` };
         for (let i = 0; i < lines.length; i++) {
           const r = Number(lines[i]);
@@ -700,8 +732,6 @@ export default function App() {
         }
       }
     }
-
-    // Validate: no duplicate ranks
     const seenRanks = new Map();
     for (const [idx, r] of Object.entries(projToRank)) {
       if (seenRanks.has(r)) {
@@ -709,7 +739,6 @@ export default function App() {
       }
       seenRanks.set(r, idx);
     }
-
     return { projToRank };
   };
 
@@ -719,16 +748,11 @@ export default function App() {
     if (parsed.error) { setPrefError(parsed.error); return; }
     const { projToRank } = parsed;
     const n = projectNames.length;
-
-    // Build new myTruePref: pref-order array of project indices.
-    // Step 1: place ranked projects at their assigned positions.
-    // Step 2: append remaining projects (in current myTruePref order) to fill the unused ranks.
     const result = new Array(n).fill(-1);
     for (const [idxStr, r] of Object.entries(projToRank)) {
       result[r - 1] = Number(idxStr);
     }
     const usedProjects = new Set(Object.keys(projToRank).map(Number));
-    // Iterate the current preference order; for any project not used, drop it into the next empty slot.
     let cursor = 0;
     for (const projIdx of myTruePref) {
       if (usedProjects.has(projIdx)) continue;
@@ -752,7 +776,6 @@ export default function App() {
       if (r.length !== n) { alert(`${team} ranking has ${r.length} entries, expected ${n}`); return; }
       if (![...r].sort((a, b) => a - b).every((v, i) => v === i + 1)) { alert(`${team} ranking is not a valid 1..${n} permutation`); return; }
     }
-    // Identity-free: rankings are just an array of length-n permutations.
     const knownRankings = Object.values(publicRankings);
     const totalOpponents = Math.max(0, totalTeams - 1);
     if (knownRankings.length > totalOpponents) {
@@ -783,11 +806,9 @@ export default function App() {
       .sort((a, b) => ranking[a] - ranking[b]);
     const text = indices.map((idx, i) => `${i + 1}. ${projectNames[idx]}`).join("\n");
     try {
-      // Try modern clipboard API
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(text);
       } else {
-        // Fallback: hidden textarea + execCommand
         const ta = document.createElement("textarea");
         ta.value = text;
         ta.style.position = "fixed"; ta.style.opacity = "0";
@@ -849,12 +870,8 @@ export default function App() {
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8, gap: 8 }}>
           <h2 style={{ margin: 0 }}>Your True Preferences</h2>
           <div style={{ display: "flex", gap: 8 }}>
-            <button className="btn btn-secondary btn-sm" onClick={() => { setPrefText(""); setPrefError(""); setPrefOpen(true); }}>
-              Paste preferences
-            </button>
-            <button className="btn btn-secondary btn-sm" onClick={() => { setImportText(""); setImportError(""); setImportOpen(true); }}>
-              Import projects
-            </button>
+            <button className="btn btn-secondary btn-sm" onClick={() => { setPrefText(""); setPrefError(""); setPrefOpen(true); }}>Paste preferences</button>
+            <button className="btn btn-secondary btn-sm" onClick={() => { setImportText(""); setImportError(""); setImportOpen(true); }}>Import projects</button>
           </div>
         </div>
         <p className="label" style={{ marginTop: 0 }}>Drag to reorder · double-click a name to rename · auto-saves to Firebase</p>
@@ -887,14 +904,10 @@ export default function App() {
           </div>
           <div className="tracker-grid">
             {Object.keys(publicRankings).map((team) => (
-              <div key={team} className="tracker-pill submitted">
-                <span className="tracker-dot" />{team}
-              </div>
+              <div key={team} className="tracker-pill submitted"><span className="tracker-dot" />{team}</div>
             ))}
             {Array.from({ length: missingCount }, (_, i) => (
-              <div key={`unknown-${i}`} className="tracker-pill waiting">
-                <span className="tracker-dot" />unknown
-              </div>
+              <div key={`unknown-${i}`} className="tracker-pill waiting"><span className="tracker-dot" />unknown</div>
             ))}
           </div>
         </div>
@@ -989,16 +1002,22 @@ export default function App() {
           </div>
 
           <div className="result-grid">
-            <div className="result-card">
-              <h4>Honest Outcome</h4>
-              <div className="result-project">{projectNames[result.hProjClean]}</div>
-              <div className="result-meta mono">{result.aiSet.has(result.hProjClean) ? "🤖 AI Project" : "Non-AI"} · True pref #{myTruePref.indexOf(result.hProjClean) + 1}</div>
-            </div>
-            <div className="result-card">
-              <h4>HC Outcome</h4>
-              <div className="result-project">{projectNames[result.hcProjClean]}</div>
-              <div className="result-meta mono">{result.aiSet.has(result.hcProjClean) ? "🤖 AI Project" : "Non-AI"} · True pref #{myTruePref.indexOf(result.hcProjClean) + 1}</div>
-            </div>
+            <OutcomeCard
+              title="Honest Outcome"
+              top3={result.hTop3}
+              worst={result.hWorstCase}
+              projectNames={result.projectNames}
+              aiSet={result.aiSet}
+              myTruePref={myTruePref}
+            />
+            <OutcomeCard
+              title="HC Outcome"
+              top3={result.hcTop3}
+              worst={result.hcWorstCase}
+              projectNames={result.projectNames}
+              aiSet={result.aiSet}
+              myTruePref={myTruePref}
+            />
           </div>
 
           <div className={`submit-block ${result.submit === "honest" ? "safe" : ""}`}>
@@ -1012,8 +1031,7 @@ export default function App() {
             <ol style={{ paddingLeft: 24, margin: 0, columnCount: 2, columnGap: 24, fontFamily: "Inter Tight, sans-serif", fontSize: "0.9rem" }}>
               {(() => {
                 const ranking = result.submit === "hc" ? result.hcRanking : result.honestRanking;
-                const indices = Array.from({ length: projectNames.length }, (_, i) => i)
-                  .sort((a, b) => ranking[a] - ranking[b]);
+                const indices = Array.from({ length: projectNames.length }, (_, i) => i).sort((a, b) => ranking[a] - ranking[b]);
                 return indices.map((projIdx) => (
                   <li key={projIdx} style={{ marginBottom: 4, breakInside: "avoid" }}>
                     {projectNames[projIdx]}
@@ -1024,25 +1042,17 @@ export default function App() {
             </ol>
           </div>
 
-          {/* If we're NOT submitting the HC ranking but HC differs, show what HC suggested
-              so the user can see what they're "missing" and judge whether to override. */}
-          {result.submit === "honest" &&
-            JSON.stringify(result.honestRanking) !== JSON.stringify(result.hcRanking) && (
+          {result.submit === "honest" && JSON.stringify(result.honestRanking) !== JSON.stringify(result.hcRanking) && (
             <div className="card mt-4" style={{ borderLeft: "3px solid var(--ember)" }}>
               <div className="flex justify-between items-center" style={{ marginBottom: 4 }}>
-                <h3 style={{ fontFamily: "Newsreader, serif", margin: 0 }}>
-                  Hill Climb's alternative ranking
-                </h3>
+                <h3 style={{ fontFamily: "Newsreader, serif", margin: 0 }}>Hill Climb's alternative ranking</h3>
                 <span className="text-fog" style={{ fontSize: "0.8rem" }}>(not recommended)</span>
               </div>
-              <p className="label" style={{ marginTop: 0, marginBottom: 12 }}>
-                What HC would have submitted instead — shown so you can compare.
-              </p>
+              <p className="label" style={{ marginTop: 0, marginBottom: 12 }}>What HC would have submitted instead — shown so you can compare.</p>
               <ol style={{ paddingLeft: 24, margin: 0, columnCount: 2, columnGap: 24, fontFamily: "Inter Tight, sans-serif", fontSize: "0.9rem" }}>
                 {(() => {
                   const ranking = result.hcRanking;
-                  const indices = Array.from({ length: projectNames.length }, (_, i) => i)
-                    .sort((a, b) => ranking[a] - ranking[b]);
+                  const indices = Array.from({ length: projectNames.length }, (_, i) => i).sort((a, b) => ranking[a] - ranking[b]);
                   return indices.map((projIdx) => (
                     <li key={projIdx} style={{ marginBottom: 4, breakInside: "avoid" }}>
                       {projectNames[projIdx]}
@@ -1069,8 +1079,8 @@ export default function App() {
                       <th>HC AI%</th>
                       <th>HC Wins</th>
                       <th>Hon Wins</th>
-                      <th>HC Mean Pref</th>
-                      <th>Hon Mean Pref</th>
+                      <th>HC Median Pref</th>
+                      <th>Hon Median Pref</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1088,15 +1098,15 @@ export default function App() {
                         <td style={{ verticalAlign: "top" }}>{row.hcAiPct.toFixed(0)}%</td>
                         <td style={{ verticalAlign: "top" }} className={row.hcWins > row.hWins ? "text-olive" : ""}>{row.hcWins}/{result.noiseTrials}</td>
                         <td style={{ verticalAlign: "top" }} className={row.hWins > row.hcWins ? "text-ember" : ""}>{row.hWins}/{result.noiseTrials}</td>
-                        <td style={{ verticalAlign: "top" }}>{row.hcMean.toFixed(2)}</td>
-                        <td style={{ verticalAlign: "top" }}>{row.hMean.toFixed(2)}</td>
+                        <td style={{ verticalAlign: "top" }}>{row.hcMedian.toFixed(1)}</td>
+                        <td style={{ verticalAlign: "top" }}>{row.hMedian.toFixed(1)}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
               <p className="text-fog" style={{ fontSize: "0.78rem", marginTop: 12, marginBottom: 0, lineHeight: 1.5 }}>
-                <b>Mean Pref</b> = average rank in your true preference list across all trials (lower is better — Mean Pref of 1.0 means you'd always get your #1 choice).<br />
+                <b>Median Pref</b> = median rank in your true preference list across all trials (lower is better — a Median Pref of 1 means you got your #1 choice in at least half of trials). Median is robust to extreme outliers, which the adversarial scenario already models separately.<br />
                 <b>Wins</b> = trials where that ranking gave a strictly better outcome than the other. Trials where both rankings produced the same outcome don't count for either side.<br />
                 <b>AI %</b> = fraction of trials where the assigned project was AI-capable.
               </p>
@@ -1150,15 +1160,11 @@ export default function App() {
         <div onClick={() => setImportOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(14,17,22,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 20 }}>
           <div onClick={(e) => e.stopPropagation()} style={{ background: "var(--paper)", border: "1px solid var(--rule)", borderRadius: 12, padding: 24, maxWidth: 640, width: "100%", maxHeight: "85vh", display: "flex", flexDirection: "column", boxShadow: "0 20px 60px rgba(14,17,22,0.25)" }}>
             <h2 style={{ marginBottom: 8 }}>Import Projects</h2>
-            <p className="label" style={{ marginTop: 0, marginBottom: 12 }}>
-              Paste one project per line. Format: <span className="mono">ID: Name</span> or just the name. Rows will be sorted by ID if all have one.
-            </p>
+            <p className="label" style={{ marginTop: 0, marginBottom: 12 }}>Paste one project per line. Format: <span className="mono">ID: Name</span> or just the name. Rows will be sorted by ID if all have one.</p>
             <textarea value={importText} onChange={(e) => setImportText(e.target.value)} placeholder={`1: Type Safe LLM Library\n2: Advising Chat Bot\n3: Moodle Date Editing\n...`} className="mono" style={{ flex: 1, minHeight: 280, fontSize: "0.82rem", lineHeight: 1.5 }} />
             {importError && <p className="manual-error" style={{ marginTop: 8 }}>{importError}</p>}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 16, gap: 12 }}>
-              <span className="text-fog" style={{ fontSize: "0.78rem" }}>
-                Replaces all project names · resets AI flags · keeps your preference order where possible
-              </span>
+              <span className="text-fog" style={{ fontSize: "0.78rem" }}>Replaces all project names · resets AI flags · keeps your preference order where possible</span>
               <div style={{ display: "flex", gap: 8 }}>
                 <button className="btn btn-secondary btn-sm" onClick={() => setImportOpen(false)}>Cancel</button>
                 <button className="btn btn-primary btn-sm" onClick={handleBulkImport}>Import</button>
@@ -1172,9 +1178,7 @@ export default function App() {
         <div onClick={() => setPrefOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(14,17,22,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 20 }}>
           <div onClick={(e) => e.stopPropagation()} style={{ background: "var(--paper)", border: "1px solid var(--rule)", borderRadius: 12, padding: 24, maxWidth: 680, width: "100%", maxHeight: "85vh", display: "flex", flexDirection: "column", boxShadow: "0 20px 60px rgba(14,17,22,0.25)" }}>
             <h2 style={{ marginBottom: 8 }}>Paste True Preferences</h2>
-            <p className="label" style={{ marginTop: 0, marginBottom: 12 }}>
-              Same semantic as opponent rankings: <span className="mono">arr[i] = rank you assign to project i</span>. Partial input is OK — unranked projects keep their current order at the end.
-            </p>
+            <p className="label" style={{ marginTop: 0, marginBottom: 12 }}>Same semantic as opponent rankings: <span className="mono">arr[i] = rank you assign to project i</span>. Partial input is OK — unranked projects keep their current order at the end.</p>
             <div style={{ fontSize: "0.78rem", color: "var(--fog)", marginBottom: 12, lineHeight: 1.6 }}>
               Three accepted formats:
               <ul style={{ margin: "4px 0 0 18px", padding: 0 }}>
@@ -1183,18 +1187,10 @@ export default function App() {
                 <li><b>One rank per line</b>: <span className="mono">5{"\n"}1{"\n"}3{"\n"}2</span> — line k = rank for project at index k-1; use 0 to skip</li>
               </ul>
             </div>
-            <textarea
-              value={prefText}
-              onChange={(e) => setPrefText(e.target.value)}
-              placeholder={`Examples:\n[6, 12, 32, 31, 30, 29, 25, 28, ...]\n\nor\n\n14: 1\n12: 2\n22: 3`}
-              className="mono"
-              style={{ flex: 1, minHeight: 240, fontSize: "0.82rem", lineHeight: 1.5 }}
-            />
+            <textarea value={prefText} onChange={(e) => setPrefText(e.target.value)} placeholder={`Examples:\n[6, 12, 32, 31, 30, 29, 25, 28, ...]\n\nor\n\n14: 1\n12: 2\n22: 3`} className="mono" style={{ flex: 1, minHeight: 240, fontSize: "0.82rem", lineHeight: 1.5 }} />
             {prefError && <p className="manual-error" style={{ marginTop: 8 }}>{prefError}</p>}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 16, gap: 12 }}>
-              <span className="text-fog" style={{ fontSize: "0.78rem" }}>
-                Updates your drag-list · projects you don't mention are appended in current order
-              </span>
+              <span className="text-fog" style={{ fontSize: "0.78rem" }}>Updates your drag-list · projects you don't mention are appended in current order</span>
               <div style={{ display: "flex", gap: 8 }}>
                 <button className="btn btn-secondary btn-sm" onClick={() => setPrefOpen(false)}>Cancel</button>
                 <button className="btn btn-primary btn-sm" onClick={handlePrefImport}>Apply</button>
@@ -1203,6 +1199,76 @@ export default function App() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ==================== OUTCOME CARD ====================
+function OutcomeCard({ title, top3, worst, projectNames, aiSet, myTruePref }) {
+  return (
+    <div className="result-card">
+      <h4>{title}</h4>
+
+      <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--rule)" }}>
+        <div style={{ fontSize: "0.7rem", fontWeight: 600, color: "var(--fog)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
+          Top 3 most likely outcomes
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          {top3.map((entry, i) => (
+            <div
+              key={i}
+              style={{
+                display: "grid",
+                gridTemplateColumns: "auto 1fr auto",
+                alignItems: "baseline",
+                gap: 10,
+                fontSize: "0.88rem",
+                lineHeight: 1.35,
+              }}
+            >
+              <span className="mono" style={{ color: "var(--fog)", fontSize: "0.78rem", minWidth: 14 }}>{i + 1}.</span>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={projectNames[entry.projIdx]}>
+                {projectNames[entry.projIdx]}
+                <span className="mono" style={{ color: "var(--fog)", marginLeft: 8, fontSize: "0.74rem" }}>
+                  #{entry.truePref + 1}{aiSet.has(entry.projIdx) ? " · AI" : ""}
+                </span>
+              </span>
+              <span className="mono" style={{ fontWeight: 600, fontSize: "0.88rem", whiteSpace: "nowrap" }}>
+                {entry.pct.toFixed(0)}%
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--rule)" }}>
+        <div style={{ fontSize: "0.7rem", fontWeight: 600, color: "var(--fog)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
+          Worst outcome that occurred
+        </div>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "1fr auto",
+            alignItems: "baseline",
+            gap: 10,
+            fontSize: "0.88rem",
+            lineHeight: 1.35,
+          }}
+        >
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={projectNames[worst.projIdx]}>
+            {projectNames[worst.projIdx]}
+            <span className="mono" style={{ color: "var(--fog)", marginLeft: 8, fontSize: "0.74rem" }}>
+              #{myTruePref.indexOf(worst.projIdx) + 1}{aiSet.has(worst.projIdx) ? " · AI" : ""}
+            </span>
+          </span>
+          <span className="mono" style={{ fontWeight: 600, fontSize: "0.88rem", whiteSpace: "nowrap" }}>
+            {worst.pctOverall.toFixed(0)}%
+          </span>
+        </div>
+        <div className="mono" style={{ color: "var(--fog)", fontSize: "0.72rem", marginTop: 4 }}>
+          {worst.pctOverall.toFixed(0)}% overall · {worst.pctAdv.toFixed(0)}% of adversarial trials
+        </div>
+      </div>
     </div>
   );
 }
