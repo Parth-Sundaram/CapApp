@@ -170,27 +170,41 @@ function clusteredPermutation(n, knownRankings, rng) {
 }
 
 // ==================== HILL CLIMB ====================
-function hillClimb(knownRankings, missingCount, myTruePref, aiSet, fillerFn, maxIter = 300, restarts = 5, seed = null) {
+// Multi-world hill climb. Instead of training against ONE fixed unknown-team
+// fill, we sample a batch of training worlds upfront and optimize the ranking
+// to perform well *on average* across all of them. This eliminates the
+// seed-specific overfitting where HC found a brilliant exploit that only
+// worked in one configuration.
+//
+// trainingWorlds: array of opponent-ranking arrays (each is the full opponent
+// roster — knownRankings concatenated with sampled unknowns).
+// Returns [bestRanking, bestAvgUtility].
+function hillClimb(trainingWorlds, myTruePref, aiSet, maxIter = 300, restarts = 5, seed = null) {
   const n = myTruePref.length;
   const rngLocal = new SeededRandom(seed ?? 42);
   const honest = makeHonest(myTruePref);
 
-  const fixedFill = [];
-  for (let i = 0; i < missingCount; i++) fixedFill.push(fillerFn(rngLocal));
-  const trainingOpponents = [...knownRankings, ...fixedFill];
+  // Score a ranking = average utility across all training worlds (MY_TEAM at last row).
+  function avgUtility(ranking) {
+    let total = 0;
+    for (const opps of trainingWorlds) {
+      total += utility(simulate(ranking, opps, "last"), myTruePref, aiSet);
+    }
+    return total / trainingWorlds.length;
+  }
 
-  let bestScore = utility(simulate(honest, trainingOpponents), myTruePref, aiSet);
+  let bestScore = avgUtility(honest);
   let bestRanking = [...honest];
 
   for (let restart = 0; restart < restarts; restart++) {
     let current = restart === 0 ? [...honest] : randomPermutation(n, rngLocal);
-    let currentScore = utility(simulate(current, trainingOpponents), myTruePref, aiSet);
+    let currentScore = avgUtility(current);
     for (let it = 0; it < maxIter; it++) {
       let bestSwap = null, bestSwapScore = currentScore;
       for (let i = 0; i < n; i++) {
         for (let j = i + 1; j < n; j++) {
           [current[i], current[j]] = [current[j], current[i]];
-          const s = utility(simulate(current, trainingOpponents), myTruePref, aiSet);
+          const s = avgUtility(current);
           if (s < bestSwapScore) { bestSwapScore = s; bestSwap = [i, j]; }
           [current[i], current[j]] = [current[j], current[i]];
         }
@@ -199,10 +213,9 @@ function hillClimb(knownRankings, missingCount, myTruePref, aiSet, fillerFn, max
       const [i, j] = bestSwap;
       [current[i], current[j]] = [current[j], current[i]];
       currentScore = bestSwapScore;
-      if (currentScore === 0) break;
+      if (currentScore <= -n) break; // can't improve below maximum possible
     }
     if (currentScore < bestScore) { bestScore = currentScore; bestRanking = [...current]; }
-    if (bestScore === 0) break;
   }
   return [bestRanking, bestScore];
 }
@@ -217,6 +230,7 @@ function robustnessCheck({
   noiseTrials = 100,
   seed = null,
   skipNoise = false,
+  trainSize = 20, // number of worlds to train HC against — averages out overfitting
 }) {
   const n = myTruePreferences.length;
   const aiSet = new Set(aiProjectIndices);
@@ -232,10 +246,32 @@ function robustnessCheck({
 
   const hProjClean = simulate(honestRanking, cleanOpponents);
   const hScoreClean = utility(hProjClean, myTruePreferences, aiSet);
+
+  // Build a batch of training worlds for HC. Mix neutral (uniform random) and
+  // clustered (matching known marginals) samples so HC trains against a
+  // representative distribution rather than one specific configuration.
+  // This is the architectural fix for the seed-specific overfitting problem.
+  const rngTrain = new SeededRandom((seed ?? 42) + 1); // offset so train ≠ clean ≠ stress
+  const trainingWorlds = [];
+  if (missingCount === 0) {
+    // No unknowns — only one possible world, no training variability needed.
+    trainingWorlds.push([...knownRankings]);
+  } else {
+    const halfTrain = Math.ceil(trainSize / 2);
+    for (let i = 0; i < halfTrain; i++) {
+      const fill = [];
+      for (let j = 0; j < missingCount; j++) fill.push(randomPermutation(n, rngTrain));
+      trainingWorlds.push([...knownRankings, ...fill]);
+    }
+    for (let i = 0; i < trainSize - halfTrain; i++) {
+      const fill = [];
+      for (let j = 0; j < missingCount; j++) fill.push(clusteredPermutation(n, knownRankings, rngTrain));
+      trainingWorlds.push([...knownRankings, ...fill]);
+    }
+  }
+
   const [hcRanking, hcScoreClean] = hillClimb(
-    knownRankings, missingCount, myTruePreferences, aiSet,
-    (rng) => randomPermutation(n, rng),
-    300, 5, seed
+    trainingWorlds, myTruePreferences, aiSet, 300, 3, seed
   );
   const hcProjClean = simulate(hcRanking, cleanOpponents);
 
@@ -346,7 +382,7 @@ function robustnessCheck({
     {
       label: "Targeted adversarial",
       key: "adversarial",
-      description: `Every unknown team submits the SAME ranking you do, creating maximum contention for whatever you put at rank #1. Tests whether your ranking survives a worst-case world where unknowns specifically target your top picks.`,
+      description: `Every unknown team submits the same ranking that you actually want most (your true preferences). Models "other students at the same school have similar tastes to me." This is the realistic worst case — unknowns who genuinely compete for your top picks because they value them like you do.`,
       sampleTrial: null,
     },
   ];
@@ -365,15 +401,17 @@ function robustnessCheck({
       const myRowForTrial = Math.floor(rng.random() * (totalOppsThisTrial + 1));
 
       if (scenario.key === "adversarial") {
-        const hOpps = [...knownRankings];
-        const hcOpps = [...knownRankings];
-        for (let i = 0; i < missingCount; i++) {
-          hOpps.push([...honestRanking]);
-          hcOpps.push([...hcRanking]);
-        }
-        hp = simulate(honestRanking, hOpps, myRowForTrial);
+        // Adversarial unknowns mirror your TRUE preferences (= honest ranking)
+        // for both candidate rankings being evaluated. This models "intelligent
+        // unknowns with the same tastes as you" — the actual real-world adversary.
+        // Both honest and HC face the same adversarial world per trial, so the
+        // comparison is apples-to-apples: which submission strategy survives
+        // when other teams also want what you want?
+        const advOpps = [...knownRankings];
+        for (let i = 0; i < missingCount; i++) advOpps.push([...honestRanking]);
+        hp = simulate(honestRanking, advOpps, myRowForTrial);
         hu = utility(hp, myTruePreferences, aiSet);
-        hcp = simulate(hcRanking, hcOpps, myRowForTrial);
+        hcp = simulate(hcRanking, advOpps, myRowForTrial);
         hcu = utility(hcp, myTruePreferences, aiSet);
       } else {
         const opps = scenario.sampleTrial(rng);
@@ -500,6 +538,7 @@ export default function App() {
   const [totalTeams, setTotalTeams] = useState(DEFAULT_TOTAL_TEAMS);
   const [jsonInput, setJsonInput] = useState("{\n  \n}");
   const [noiseTrials, setNoiseTrials] = useState(100);
+  const [trainSize, setTrainSize] = useState(20);
   const [seed, setSeed] = useState(42);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -793,6 +832,7 @@ export default function App() {
         noiseTrials,
         seed,
         skipNoise: demoMode,
+        trainSize,
       });
       setResult(check);
       setLoading(false);
@@ -974,6 +1014,10 @@ export default function App() {
             <input type="number" min={2} value={totalTeams} onChange={(e) => setAndSaveTotalTeams(Math.max(2, Number(e.target.value) || 2))} />
           </div>
           <div><p className="label">Noise Trials</p><input type="number" value={noiseTrials} onChange={(e) => setNoiseTrials(Number(e.target.value))} /></div>
+          <div>
+            <p className="label" title="More worlds = more robust HC, but slower training. 20 ≈ 1 min, 30 ≈ 2 min.">HC Training Worlds</p>
+            <input type="number" min={1} max={100} value={trainSize} onChange={(e) => setTrainSize(Math.max(1, Number(e.target.value) || 1))} />
+          </div>
           <div><p className="label">Random Seed</p><input type="number" value={seed} onChange={(e) => setSeed(Number(e.target.value))} /></div>
         </div>
         <div className="mode-toggle-row">
@@ -984,7 +1028,7 @@ export default function App() {
       </section>
 
       <button className="btn btn-primary w-full mt-4" onClick={runAnalysis} disabled={loading}>
-        {loading ? "Running Hungarian + Hill Climb…" : demoMode ? "Run Quick Check" : "Run Robustness Check"}
+        {loading ? `Training HC across ${trainSize} worlds…` : demoMode ? "Run Quick Check" : "Run Robustness Check"}
       </button>
 
       {result && (
