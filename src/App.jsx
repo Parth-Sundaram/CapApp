@@ -170,21 +170,11 @@ function clusteredPermutation(n, knownRankings, rng) {
 }
 
 // ==================== HILL CLIMB ====================
-// Multi-world hill climb. Instead of training against ONE fixed unknown-team
-// fill, we sample a batch of training worlds upfront and optimize the ranking
-// to perform well *on average* across all of them. This eliminates the
-// seed-specific overfitting where HC found a brilliant exploit that only
-// worked in one configuration.
-//
-// trainingWorlds: array of opponent-ranking arrays (each is the full opponent
-// roster — knownRankings concatenated with sampled unknowns).
-// Returns [bestRanking, bestAvgUtility].
 function hillClimb(trainingWorlds, myTruePref, aiSet, maxIter = 300, restarts = 5, seed = null) {
   const n = myTruePref.length;
   const rngLocal = new SeededRandom(seed ?? 42);
   const honest = makeHonest(myTruePref);
 
-  // Score a ranking = average utility across all training worlds (MY_TEAM at last row).
   function avgUtility(ranking) {
     let total = 0;
     for (const opps of trainingWorlds) {
@@ -213,7 +203,7 @@ function hillClimb(trainingWorlds, myTruePref, aiSet, maxIter = 300, restarts = 
       const [i, j] = bestSwap;
       [current[i], current[j]] = [current[j], current[i]];
       currentScore = bestSwapScore;
-      if (currentScore <= -n) break; // can't improve below maximum possible
+      if (currentScore <= -n) break;
     }
     if (currentScore < bestScore) { bestScore = currentScore; bestRanking = [...current]; }
   }
@@ -230,7 +220,7 @@ function robustnessCheck({
   noiseTrials = 100,
   seed = null,
   skipNoise = false,
-  trainSize = 20, // number of worlds to train HC against — averages out overfitting
+  trainSize = 20,
 }) {
   const n = myTruePreferences.length;
   const aiSet = new Set(aiProjectIndices);
@@ -247,14 +237,9 @@ function robustnessCheck({
   const hProjClean = simulate(honestRanking, cleanOpponents);
   const hScoreClean = utility(hProjClean, myTruePreferences, aiSet);
 
-  // Build a batch of training worlds for HC. Mix neutral (uniform random) and
-  // clustered (matching known marginals) samples so HC trains against a
-  // representative distribution rather than one specific configuration.
-  // This is the architectural fix for the seed-specific overfitting problem.
-  const rngTrain = new SeededRandom((seed ?? 42) + 1); // offset so train ≠ clean ≠ stress
+  const rngTrain = new SeededRandom((seed ?? 42) + 1);
   const trainingWorlds = [];
   if (missingCount === 0) {
-    // No unknowns — only one possible world, no training variability needed.
     trainingWorlds.push([...knownRankings]);
   } else {
     const halfTrain = Math.ceil(trainSize / 2);
@@ -275,7 +260,6 @@ function robustnessCheck({
   );
   const hcProjClean = simulate(hcRanking, cleanOpponents);
 
-  // modal: most common outcome, tie-broken by best true-pref rank
   function modal(outcomes) {
     if (!outcomes || outcomes.length === 0) return null;
     const counts = new Map();
@@ -290,8 +274,6 @@ function robustnessCheck({
     return { projIdx: bestP, count: bestC, total: outcomes.length, pct: (bestC / outcomes.length) * 100 };
   }
 
-  // topNModal: top N most common outcomes ordered by frequency. Ties broken by
-  // better (lower) true-pref rank. Only includes outcomes that actually occurred.
   function topNModal(outcomes, n) {
     if (!outcomes || outcomes.length === 0) return [];
     const counts = new Map();
@@ -311,7 +293,6 @@ function robustnessCheck({
     return entries.slice(0, n);
   }
 
-  // worst: single worst true-pref outcome across all adversarial trials
   function worst(outcomes) {
     if (!outcomes || outcomes.length === 0) return null;
     let worstP = -1, worstTruePref = -1;
@@ -324,7 +305,6 @@ function robustnessCheck({
   }
 
   if (hcScoreClean >= hScoreClean) {
-    const deterministicModal = (projIdx) => ({ projIdx, count: 1, total: 1, pct: 100 });
     const deterministicTop3 = (projIdx) => [{ projIdx, count: 1, total: 1, pct: 100, truePref: myTruePreferences.indexOf(projIdx) }];
     const deterministicWorst = (projIdx) => ({ projIdx, countAdv: 1, totalAdv: 1, pctAdv: 100, countOverall: 1, totalOverall: 1, pctOverall: 100 });
     return {
@@ -332,8 +312,6 @@ function robustnessCheck({
       reason: "HC found no improvement over honest. Nothing to risk.",
       knownCount: knownRankings.length, missingCount, projectNames: projNames,
       noiseResults: null, hProjClean, hcProjClean, noiseTrials, aiSet,
-      hMostLikely: deterministicModal(hProjClean),
-      hcMostLikely: deterministicModal(hcProjClean),
       hWorstCase: deterministicWorst(hProjClean),
       hcWorstCase: deterministicWorst(hcProjClean),
       hTop3: deterministicTop3(hProjClean),
@@ -341,7 +319,6 @@ function robustnessCheck({
     };
   }
   if (skipNoise) {
-    const deterministicModal = (projIdx) => ({ projIdx, count: 1, total: 1, pct: 100 });
     const deterministicTop3 = (projIdx) => [{ projIdx, count: 1, total: 1, pct: 100, truePref: myTruePreferences.indexOf(projIdx) }];
     const deterministicWorst = (projIdx) => ({ projIdx, countAdv: 1, totalAdv: 1, pctAdv: 100, countOverall: 1, totalOverall: 1, pctOverall: 100 });
     return {
@@ -349,8 +326,6 @@ function robustnessCheck({
       reason: "Demo mode: HC improves on clean data. Skipped stress trials.",
       knownCount: knownRankings.length, missingCount, projectNames: projNames,
       noiseResults: null, hProjClean, hcProjClean, noiseTrials, aiSet,
-      hMostLikely: deterministicModal(hProjClean),
-      hcMostLikely: deterministicModal(hcProjClean),
       hWorstCase: deterministicWorst(hProjClean),
       hcWorstCase: deterministicWorst(hcProjClean),
       hTop3: deterministicTop3(hProjClean),
@@ -382,7 +357,7 @@ function robustnessCheck({
     {
       label: "Targeted adversarial",
       key: "adversarial",
-      description: `Every unknown team submits the same ranking that you actually want most (your true preferences). Models "other students at the same school have similar tastes to me." This is the realistic worst case — unknowns who genuinely compete for your top picks because they value them like you do.`,
+      description: `Every unknown team submits the same ranking that you actually want most (your true preferences). Models "other students at the same school have similar tastes to me." Worst-case sidebar — not included in overall outcome aggregates because it represents a single extreme assumption, not the realistic distribution.`,
       sampleTrial: null,
     },
   ];
@@ -392,8 +367,8 @@ function robustnessCheck({
 
   for (const scenario of scenarios) {
     let hAi = 0, hcAi = 0, hcWins = 0, hWins = 0;
-    const hPrefs = [], hcPrefs = []; // utility values (for verdict wins/aggregates)
-    const hRanks = [], hcRanks = []; // 1-indexed true-pref ranks (for median display)
+    const hPrefs = [], hcPrefs = [];
+    const hRanks = [], hcRanks = [];
     const hOutcomes = [], hcOutcomes = [];
     for (let t = 0; t < noiseTrials; t++) {
       let hu, hcu, hp, hcp;
@@ -401,12 +376,6 @@ function robustnessCheck({
       const myRowForTrial = Math.floor(rng.random() * (totalOppsThisTrial + 1));
 
       if (scenario.key === "adversarial") {
-        // Adversarial unknowns mirror your TRUE preferences (= honest ranking)
-        // for both candidate rankings being evaluated. This models "intelligent
-        // unknowns with the same tastes as you" — the actual real-world adversary.
-        // Both honest and HC face the same adversarial world per trial, so the
-        // comparison is apples-to-apples: which submission strategy survives
-        // when other teams also want what you want?
         const advOpps = [...knownRankings];
         for (let i = 0; i < missingCount; i++) advOpps.push([...honestRanking]);
         hp = simulate(honestRanking, advOpps, myRowForTrial);
@@ -424,12 +393,10 @@ function robustnessCheck({
       hcOutcomes.push(hcp);
       hPrefs.push(hu < 1000 ? hu : 99); if (aiSet.has(hp)) hAi++;
       hcPrefs.push(hcu < 1000 ? hcu : 99); if (aiSet.has(hcp)) hcAi++;
-      // 1-indexed true-pref rank for clean display (no AI tiebreaker)
       hRanks.push(myTruePreferences.indexOf(hp) + 1);
       hcRanks.push(myTruePreferences.indexOf(hcp) + 1);
       if (hu < hcu) hWins++; else if (hcu < hu) hcWins++;
     }
-    // medians computed from the clean 1-indexed ranks, not utility values
     const sortedHRanks = [...hRanks].sort((a, b) => a - b);
     const sortedHcRanks = [...hcRanks].sort((a, b) => a - b);
     const medianOf = (sorted) => {
@@ -453,62 +420,84 @@ function robustnessCheck({
     });
   }
 
-  const allHonestOutcomes = rows.flatMap((r) => r.hOutcomes);
-  const allHcOutcomes = rows.flatMap((r) => r.hcOutcomes);
+  // ──────────────────────────────────────────────────────────────────────
+  // Aggregate computation: EXCLUDE adversarial. Adversarial is shown as a
+  // sidebar in the stress test table but does not contribute to the
+  // "what's likely to happen" summary or to the verdict gating. Adversarial
+  // is a single extreme assumption ("everyone else wants exactly what you
+  // want"), not a representative sample of plausible worlds — pooling it
+  // into the aggregates 1:1 with neutral and clustered would let one
+  // worst-case assumption dominate the displayed probabilities.
+  // ──────────────────────────────────────────────────────────────────────
+  const realisticRows = rows.filter((r) => r.key !== "adversarial");
   const adversarialRow = rows.find((r) => r.key === "adversarial");
 
-  const hMostLikely = modal(allHonestOutcomes);
-  const hcMostLikely = modal(allHcOutcomes);
-  // Top 3 most-likely outcomes pooled across all stress trials.
-  const hTop3 = topNModal(allHonestOutcomes, 3);
-  const hcTop3 = topNModal(allHcOutcomes, 3);
-  // Worst case: single worst true-pref project that appeared in adversarial trials.
-  // Report TWO percentages so readers see both the scenario rate and the overall rate:
-  //   - pctAdv:     % of adversarial trials where this project was the outcome
-  //   - pctOverall: % of all 300 trials (3 scenarios pooled)
-  function computeWorstCase(advOutcomes, allOutcomes) {
+  const realisticHonestOutcomes = realisticRows.flatMap((r) => r.hOutcomes);
+  const realisticHcOutcomes = realisticRows.flatMap((r) => r.hcOutcomes);
+
+  // Top 3 outcomes computed from realistic (neutral + clustered) only.
+  const hTop3 = topNModal(realisticHonestOutcomes, 3);
+  const hcTop3 = topNModal(realisticHcOutcomes, 3);
+
+  // Worst case: still derived from adversarial trials (the worst-case projects
+  // ARE the adversarial outcomes), but `pctOverall` is computed against
+  // realistic trials, not total. This lets the user see "if adversarial hits,
+  // this is the bad project — and here's how often it shows up in realistic
+  // worlds."
+  function computeWorstCase(advOutcomes, realisticOutcomes) {
     const w = worst(advOutcomes);
     if (!w) return null;
-    const overallCount = allOutcomes.filter(p => p === w.projIdx).length;
+    const realisticCount = realisticOutcomes.filter(p => p === w.projIdx).length;
     return {
       projIdx: w.projIdx,
       countAdv: w.count,
       totalAdv: w.total,
       pctAdv: w.pct,
-      countOverall: overallCount,
-      totalOverall: allOutcomes.length,
-      pctOverall: (overallCount / allOutcomes.length) * 100,
+      countOverall: realisticCount,
+      totalOverall: realisticOutcomes.length,
+      pctOverall: (realisticCount / realisticOutcomes.length) * 100,
     };
   }
-  const hWorstCase = adversarialRow ? computeWorstCase(adversarialRow.hOutcomes, allHonestOutcomes) : null;
-  const hcWorstCase = adversarialRow ? computeWorstCase(adversarialRow.hcOutcomes, allHcOutcomes) : null;
+  const hWorstCase = adversarialRow ? computeWorstCase(adversarialRow.hOutcomes, realisticHonestOutcomes) : null;
+  const hcWorstCase = adversarialRow ? computeWorstCase(adversarialRow.hcOutcomes, realisticHcOutcomes) : null;
 
   const neutral = rows.find((r) => r.key === "neutral");
   const clustered = rows.find((r) => r.key === "clustered");
-  const adversarial = rows.find((r) => r.key === "adversarial");
+  const adversarial = adversarialRow;
   let verdict, submit, reason;
 
-  const advHonestWins = adversarial.hWins;
-  const advThreshold = noiseTrials * 0.6;
+  // ──────────────────────────────────────────────────────────────────────
+  // Verdict gating: neutral and clustered are the hard gates. Adversarial
+  // is a SOFT WARNING — if HC catastrophically loses adversarial but wins
+  // both realistic scenarios, the verdict is still SAFE/RISKY with a
+  // caveat in the reason text. Adversarial alone can no longer flip a
+  // SAFE verdict to UNSAFE.
+  // ──────────────────────────────────────────────────────────────────────
   const neutralOK = neutral.hcWins >= noiseTrials * 0.45 || neutral.hcMedian <= neutral.hMedian;
   const clusteredOK = clustered.hcWins >= noiseTrials * 0.45 || clustered.hcMedian <= clustered.hMedian;
-  const adversarialOK = advHonestWins < advThreshold;
+  const adversarialBadlyLoses = adversarial.hWins >= noiseTrials * 0.8;
+
+  function buildAdvCaveat() {
+    if (!adversarialBadlyLoses) return "";
+    const worstName = projNames[hcWorstCase.projIdx];
+    const advRank = myTruePreferences.indexOf(hcWorstCase.projIdx) + 1;
+    return ` Note: in the worst-case scenario where every unknown team converges on your preferences, HC lands you on ${worstName} (your rank #${advRank}) in ${hcWorstCase.pctAdv.toFixed(0)}% of those trials. That scenario is a sidebar, not a typical outcome — but worth being aware of.`;
+  }
 
   if (missingCount === 0) {
     verdict = "SAFE"; submit = "hc";
     reason = `All ${knownRankings.length} opponent rankings are known. HC outcome is deterministic.`;
-  } else if (neutralOK && clusteredOK && adversarialOK) {
+  } else if (neutralOK && clusteredOK) {
     verdict = "SAFE"; submit = "hc";
-    reason = `HC survives all three scenarios. Neutral: ${neutral.hcWins}/${noiseTrials} wins. Clustered: ${clustered.hcWins}/${noiseTrials}. Adversarial: honest wins ${advHonestWins}/${noiseTrials}.`;
-  } else if (!adversarialOK) {
+    reason = `HC survives realistic scenarios. Neutral: ${neutral.hcWins}/${noiseTrials} wins. Clustered: ${clustered.hcWins}/${noiseTrials}.` + buildAdvCaveat();
+  } else if (!neutralOK && !clusteredOK) {
     verdict = "UNSAFE"; submit = "honest";
-    reason = `HC collapses under adversarial scenarios. Honest wins ${advHonestWins}/${noiseTrials} when ${missingCount} unknown teams converge against you.`;
-  } else if (!neutralOK) {
-    verdict = "UNSAFE"; submit = "honest";
-    reason = `HC loses even under neutral random unknowns: honest wins ${neutral.hWins}/${noiseTrials}. The exploit doesn't survive ${missingCount} unknown teams.`;
+    reason = `HC loses both realistic scenarios. Neutral: honest wins ${neutral.hWins}/${noiseTrials}. Clustered: honest wins ${clustered.hWins}/${noiseTrials}. The exploit doesn't survive normal unknown teams.`;
   } else {
     verdict = "RISKY"; submit = "honest";
-    reason = `HC wins neutral (${neutral.hcWins}/${noiseTrials}) but is fragile in clustered/adversarial cases. With ${missingCount} unknown teams the edge is thin.`;
+    const losing = !neutralOK ? "neutral" : "clustered";
+    const losingRow = !neutralOK ? neutral : clustered;
+    reason = `HC wins one realistic scenario but loses ${losing} (honest wins ${losingRow.hWins}/${noiseTrials}). Edge is fragile.` + buildAdvCaveat();
   }
 
   return {
@@ -516,7 +505,7 @@ function robustnessCheck({
     knownCount: knownRankings.length, missingCount,
     projectNames: projNames, noiseResults: rows,
     hProjClean, hcProjClean, noiseTrials, aiSet,
-    hMostLikely, hcMostLikely, hWorstCase, hcWorstCase,
+    hWorstCase, hcWorstCase,
     hTop3, hcTop3,
   };
 }
@@ -1112,7 +1101,7 @@ export default function App() {
             <div className="card mt-4">
               <h2>Stress Test Across Unknown-Team Scenarios</h2>
               <p className="label" style={{ marginTop: -8 }}>
-                {result.knownCount} known ranking{result.knownCount === 1 ? "" : "s"} frozen. Only the {result.missingCount} unknown team{result.missingCount === 1 ? "" : "s"} {result.missingCount === 1 ? "is" : "are"} sampled per trial.
+                {result.knownCount} known ranking{result.knownCount === 1 ? "" : "s"} frozen. Only the {result.missingCount} unknown team{result.missingCount === 1 ? "" : "s"} {result.missingCount === 1 ? "is" : "are"} sampled per trial. Adversarial scenario is informational only — it does not affect the verdict or the Top 3 outcomes.
               </p>
               <div style={{ overflowX: "auto" }}>
                 <table className="data-table mono">
@@ -1123,15 +1112,17 @@ export default function App() {
                       <th>HC AI%</th>
                       <th>HC Wins</th>
                       <th>Hon Wins</th>
-                      <th>HC Median Pref</th>
-                      <th>Hon Median Pref</th>
+                      <th>HC Median</th>
+                      <th>Hon Median</th>
+                      <th>HC Mean</th>
+                      <th>Hon Mean</th>
                     </tr>
                   </thead>
                   <tbody>
                     {result.noiseResults.map((row, i) => (
-                      <tr key={i}>
+                      <tr key={i} style={row.key === "adversarial" ? { opacity: 0.7 } : {}}>
                         <td style={{ fontFamily: "Inter Tight, sans-serif", verticalAlign: "top", maxWidth: 280 }}>
-                          <div style={{ fontWeight: 600 }}>{row.label}</div>
+                          <div style={{ fontWeight: 600 }}>{row.label}{row.key === "adversarial" && <span style={{ marginLeft: 8, fontSize: "0.7rem", color: "var(--fog)", fontWeight: 400 }}>sidebar</span>}</div>
                           {row.description && (
                             <div style={{ fontSize: "0.72rem", color: "var(--fog)", marginTop: 4, lineHeight: 1.4, fontFamily: "Inter Tight, sans-serif", whiteSpace: "normal" }}>
                               {row.description}
@@ -1142,16 +1133,20 @@ export default function App() {
                         <td style={{ verticalAlign: "top" }}>{row.hcAiPct.toFixed(0)}%</td>
                         <td style={{ verticalAlign: "top" }} className={row.hcWins > row.hWins ? "text-olive" : ""}>{row.hcWins}/{result.noiseTrials}</td>
                         <td style={{ verticalAlign: "top" }} className={row.hWins > row.hcWins ? "text-ember" : ""}>{row.hWins}/{result.noiseTrials}</td>
-                        <td style={{ verticalAlign: "top" }}>{row.hcMedian.toFixed(1)}</td>
+                        <td style={{ verticalAlign: "top" }} className={row.hcMedian < row.hMedian ? "text-olive" : row.hcMedian > row.hMedian ? "text-ember" : ""}>{row.hcMedian.toFixed(1)}</td>
                         <td style={{ verticalAlign: "top" }}>{row.hMedian.toFixed(1)}</td>
+                        <td style={{ verticalAlign: "top" }} className={row.hcMean < row.hMean ? "text-olive" : row.hcMean > row.hMean ? "text-ember" : ""}>{row.hcMean.toFixed(1)}</td>
+                        <td style={{ verticalAlign: "top" }}>{row.hMean.toFixed(1)}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
               <p className="text-fog" style={{ fontSize: "0.78rem", marginTop: 12, marginBottom: 0, lineHeight: 1.5 }}>
-                <b>Median Pref</b> = median rank in your true preference list across all trials (lower is better — a Median Pref of 1 means you got your #1 choice in at least half of trials). Median is robust to extreme outliers, which the adversarial scenario already models separately.<br />
-                <b>Wins</b> = trials where that ranking gave a strictly better outcome than the other. Trials where both rankings produced the same outcome don't count for either side.<br />
+                <b>Median</b> = middle outcome rank across trials. Robust to extreme outliers; tells you "the typical outcome."<br />
+                <b>Mean</b> = average outcome rank. Sensitive to tails; lower mean means HC's distribution is more concentrated near your top picks.<br />
+                When <b>Median {"<"} Mean</b> (gap pulling right), the distribution has a heavy right tail — HC mostly lands well but occasionally lands badly. When both agree, the outcome is consistent.<br />
+                <b>Wins</b> = trials where that ranking gave a strictly better utility (rank + small AI bonus). Ties don't count for either side.<br />
                 <b>AI %</b> = fraction of trials where the assigned project was AI-capable.
               </p>
             </div>
@@ -1287,7 +1282,7 @@ function OutcomeCard({ title, top3, worst, projectNames, aiSet, myTruePref }) {
 
       <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--rule)" }}>
         <div style={{ fontSize: "0.7rem", fontWeight: 600, color: "var(--fog)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
-          Worst outcome that occurred
+          Worst-case sidebar (adversarial)
         </div>
         <div
           style={{
@@ -1306,11 +1301,11 @@ function OutcomeCard({ title, top3, worst, projectNames, aiSet, myTruePref }) {
             </span>
           </span>
           <span className="mono" style={{ fontWeight: 600, fontSize: "0.88rem", whiteSpace: "nowrap" }}>
-            {worst.pctOverall.toFixed(0)}%
+            {worst.pctAdv.toFixed(0)}%
           </span>
         </div>
         <div className="mono" style={{ color: "var(--fog)", fontSize: "0.72rem", marginTop: 4 }}>
-          {worst.pctOverall.toFixed(0)}% overall · {worst.pctAdv.toFixed(0)}% of adversarial trials
+          {worst.pctAdv.toFixed(0)}% of adversarial trials · {worst.pctOverall.toFixed(0)}% in realistic worlds
         </div>
       </div>
     </div>
