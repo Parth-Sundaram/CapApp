@@ -210,6 +210,192 @@ function hillClimb(trainingWorlds, myTruePref, aiSet, maxIter = 300, restarts = 
   return [bestRanking, bestScore];
 }
 
+// ==================== STRESS TEST HELPER ====================
+// Runs the three stress scenarios comparing rankingA vs rankingB. Returns one
+// row per scenario with all the metrics. Used by both robustnessCheck (for
+// honest vs HC) and the custom-ranking section (for custom vs honest).
+function stressTestRanking({
+  rankingA,
+  rankingB,
+  honestRanking, // adversarial scenario uses this for unknown mirrors
+  myTruePreferences,
+  aiSet,
+  knownRankings,
+  missingCount,
+  noiseTrials = 100,
+  seed = null,
+}) {
+  const n = myTruePreferences.length;
+  const scenarios = [
+    {
+      label: "Uniform random",
+      key: "neutral",
+      description: "Each unknown team's ranking is a uniform-random permutation. No assumption about correlated tastes. The most pessimistic baseline that still treats unknowns as independent.",
+      sampleTrial: (rng) => {
+        const fill = [];
+        for (let i = 0; i < missingCount; i++) fill.push(randomPermutation(n, rng));
+        return [...knownRankings, ...fill];
+      },
+    },
+    {
+      label: "Following known patterns",
+      key: "clustered",
+      description: `Each unknown team samples a ranking from the empirical rank distribution of the ${knownRankings.length} known teams. If a project sat at rank 1 for half the known teams, unknowns rank it #1 about half the time. Models "students at the same school have correlated tastes."`,
+      sampleTrial: (rng) => {
+        const fill = [];
+        for (let i = 0; i < missingCount; i++) fill.push(clusteredPermutation(n, knownRankings, rng));
+        return [...knownRankings, ...fill];
+      },
+    },
+    {
+      label: "Targeted adversarial",
+      key: "adversarial",
+      description: `Every unknown team submits the same ranking that you actually want most (your true preferences). Models "other students at the same school have similar tastes to me." Worst-case sidebar.`,
+      sampleTrial: null,
+    },
+  ];
+
+  const rng = new SeededRandom(seed ?? 42);
+  const rows = [];
+
+  for (const scenario of scenarios) {
+    let aAi = 0, bAi = 0, aWins = 0, bWins = 0;
+    const aRanks = [], bRanks = [];
+    const aOutcomes = [], bOutcomes = [];
+    for (let t = 0; t < noiseTrials; t++) {
+      const totalOppsThisTrial = knownRankings.length + missingCount;
+      const myRowForTrial = Math.floor(rng.random() * (totalOppsThisTrial + 1));
+      let opps;
+      if (scenario.key === "adversarial") {
+        opps = [...knownRankings];
+        for (let i = 0; i < missingCount; i++) opps.push([...honestRanking]);
+      } else {
+        opps = scenario.sampleTrial(rng);
+      }
+      const ap = simulate(rankingA, opps, myRowForTrial);
+      const bp = simulate(rankingB, opps, myRowForTrial);
+      const au = utility(ap, myTruePreferences, aiSet);
+      const bu = utility(bp, myTruePreferences, aiSet);
+      aOutcomes.push(ap); bOutcomes.push(bp);
+      if (aiSet.has(ap)) aAi++; if (aiSet.has(bp)) bAi++;
+      aRanks.push(myTruePreferences.indexOf(ap) + 1);
+      bRanks.push(myTruePreferences.indexOf(bp) + 1);
+      if (au < bu) aWins++; else if (bu < au) bWins++;
+    }
+    const medianOf = (arr) => {
+      const s = [...arr].sort((a, b) => a - b);
+      const m = s.length;
+      if (m === 0) return 0;
+      return m % 2 === 1 ? s[(m - 1) / 2] : (s[m / 2 - 1] + s[m / 2]) / 2;
+    };
+    rows.push({
+      label: scenario.label,
+      key: scenario.key,
+      description: scenario.description,
+      aAiPct: (aAi / noiseTrials) * 100,
+      bAiPct: (bAi / noiseTrials) * 100,
+      aMedian: medianOf(aRanks),
+      bMedian: medianOf(bRanks),
+      aWins, bWins,
+      aOutcomes, bOutcomes,
+    });
+  }
+  return rows;
+}
+
+// ==================== CUSTOM RANKING TEST ====================
+// Stress-tests a user-supplied ranking against honest, using the same three
+// scenarios as the main robustness check. Fast — no HC training needed.
+function customRankingTest({
+  customRanking,
+  myTruePreferences,
+  knownRankings,
+  totalOpponents,
+  aiProjectIndices,
+  projectNames,
+  noiseTrials = 100,
+  seed = null,
+}) {
+  const n = myTruePreferences.length;
+  const aiSet = new Set(aiProjectIndices);
+  const missingCount = Math.max(0, totalOpponents - knownRankings.length);
+  const honestRanking = makeHonest(myTruePreferences);
+  const projNames = projectNames || Array.from({ length: n }, (_, i) => `Proj_${String(i).padStart(2, "0")}`);
+
+  const rows = missingCount === 0
+    ? null
+    : stressTestRanking({
+        rankingA: customRanking,
+        rankingB: honestRanking,
+        honestRanking,
+        myTruePreferences,
+        aiSet,
+        knownRankings,
+        missingCount,
+        noiseTrials,
+        seed,
+      });
+
+  // When there are no unknown teams, both outcomes are fully deterministic
+  // (single Hungarian solve). Compute and surface them so the user sees the
+  // actual outcome instead of just "deterministic".
+  const deterministicOutcome = missingCount === 0
+    ? {
+        customProj: simulate(customRanking, knownRankings),
+        honestProj: simulate(honestRanking, knownRankings),
+      }
+    : null;
+
+  // Pool outcomes across the two realistic scenarios for the top-3 card
+  // (excludes adversarial, same convention as the main result section).
+  function topNModal(outcomes, k) {
+    if (!outcomes || outcomes.length === 0) return [];
+    const counts = new Map();
+    for (const p of outcomes) counts.set(p, (counts.get(p) || 0) + 1);
+    const total = outcomes.length;
+    const entries = [];
+    for (const [p, c] of counts.entries()) {
+      entries.push({
+        projIdx: p, count: c, total, pct: (c / total) * 100,
+        truePref: myTruePreferences.indexOf(p),
+      });
+    }
+    entries.sort((a, b) => (b.count !== a.count) ? b.count - a.count : a.truePref - b.truePref);
+    return entries.slice(0, k);
+  }
+
+  const customOutcomesRealistic = rows
+    ? rows.filter(r => r.key !== "adversarial").flatMap(r => r.aOutcomes)
+    : [];
+  const customTop3 = topNModal(customOutcomesRealistic, 3);
+
+  // Worst outcome that occurred in adversarial trials (informational)
+  const advRow = rows ? rows.find(r => r.key === "adversarial") : null;
+  let customWorst = null;
+  if (advRow && advRow.aOutcomes.length > 0) {
+    let worstP = -1, worstTruePref = -1;
+    for (const p of advRow.aOutcomes) {
+      const tp = myTruePreferences.indexOf(p);
+      if (tp > worstTruePref) { worstTruePref = tp; worstP = p; }
+    }
+    const count = advRow.aOutcomes.filter(p => p === worstP).length;
+    customWorst = { projIdx: worstP, count, total: advRow.aOutcomes.length, pct: (count / advRow.aOutcomes.length) * 100 };
+  }
+
+  return {
+    rows,
+    customRanking,
+    honestRanking,
+    projectNames: projNames,
+    aiSet,
+    noiseTrials,
+    missingCount,
+    customTop3,
+    customWorst,
+    deterministicOutcome,
+  };
+}
+
 // ==================== ROBUSTNESS CHECK ====================
 function robustnessCheck({
   myTruePreferences,
@@ -531,6 +717,11 @@ export default function App() {
   const [seed, setSeed] = useState(42);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
+  // Custom ranking tester state. customRanking is indexed by projIdx → submitted rank.
+  // Starts as null (uninitialized); once initialized, it's a length-N array of ranks.
+  const [customRanking, setCustomRanking] = useState(null);
+  const [customResult, setCustomResult] = useState(null);
+  const [customLoading, setCustomLoading] = useState(false);
   const [demoMode, setDemoMode] = useState(true);
   const [dragOverIndex, setDragOverIndex] = useState(null);
   const [jsonStatus, setJsonStatus] = useState({ kind: "idle", message: "ready" });
@@ -825,6 +1016,79 @@ export default function App() {
       });
       setResult(check);
       setLoading(false);
+    }, 50);
+  };
+
+  // Initialize the custom ranking from honest. Called when the user expands
+  // the custom section for the first time, or clicks "Reset to Honest".
+  const initCustomRanking = () => {
+    const n = projectNames.length;
+    const honest = new Array(n).fill(0);
+    myTruePref.forEach((projIdx, rank) => { honest[projIdx] = rank + 1; });
+    setCustomRanking(honest);
+    setCustomResult(null);
+  };
+
+  // Update one project's rank. Allows duplicates intentionally — validation
+  // is done at the time of running the stress test.
+  const updateCustomRank = (projIdx, newRank) => {
+    setCustomRanking((prev) => {
+      if (!prev) return prev;
+      const next = [...prev];
+      next[projIdx] = newRank;
+      return next;
+    });
+    setCustomResult(null); // any change invalidates prior result
+  };
+
+  // Validate custom ranking: must be a permutation of 1..n. Returns:
+  //   { valid: true } or { valid: false, duplicates: [...], missing: [...], invalid: [...] }
+  const validateCustomRanking = (ranking) => {
+    if (!ranking) return { valid: false, duplicates: [], missing: [], invalid: [] };
+    const n = projectNames.length;
+    const seen = new Map(); // rank → [projIdx, ...]
+    const invalid = []; // ranks out of 1..n
+    for (let i = 0; i < n; i++) {
+      const r = ranking[i];
+      if (!Number.isInteger(r) || r < 1 || r > n) {
+        invalid.push(i);
+        continue;
+      }
+      if (!seen.has(r)) seen.set(r, []);
+      seen.get(r).push(i);
+    }
+    const duplicates = [];
+    for (const [r, idxs] of seen.entries()) {
+      if (idxs.length > 1) duplicates.push({ rank: r, projIdxs: idxs });
+    }
+    const missing = [];
+    for (let r = 1; r <= n; r++) if (!seen.has(r)) missing.push(r);
+    return {
+      valid: duplicates.length === 0 && missing.length === 0 && invalid.length === 0,
+      duplicates, missing, invalid,
+    };
+  };
+
+  const runCustomStressTest = () => {
+    if (!customRanking) return;
+    const val = validateCustomRanking(customRanking);
+    if (!val.valid) return;
+    const knownRankings = Object.values(publicRankings);
+    const totalOpponents = Math.max(0, totalTeams - 1);
+    setCustomLoading(true);
+    setTimeout(() => {
+      const check = customRankingTest({
+        customRanking,
+        myTruePreferences: myTruePref,
+        knownRankings,
+        totalOpponents,
+        aiProjectIndices: Array.from(aiProjectIndices),
+        projectNames,
+        noiseTrials,
+        seed,
+      });
+      setCustomResult(check);
+      setCustomLoading(false);
     }, 50);
   };
 
@@ -1194,6 +1458,270 @@ export default function App() {
           )}
         </div>
       )}
+
+      {/* ==================== CUSTOM RANKING TESTER ==================== */}
+      <section className="card mt-4">
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8, gap: 8, flexWrap: "wrap" }}>
+          <div>
+            <h2 style={{ margin: 0 }}>Try Your Own Ranking</h2>
+            <p className="label" style={{ marginTop: 4, marginBottom: 0 }}>
+              Enter any custom ranking and stress-test it against the same three scenarios. Useful for exploring "what if I submitted X?"
+            </p>
+          </div>
+          {customRanking ? (
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn btn-secondary btn-sm" onClick={initCustomRanking}>Reset to Honest</button>
+              <button className="btn btn-secondary btn-sm" onClick={() => { setCustomRanking(null); setCustomResult(null); }}>Hide</button>
+            </div>
+          ) : (
+            <button className="btn btn-primary btn-sm" onClick={initCustomRanking}>Start Building</button>
+          )}
+        </div>
+
+        {customRanking && (() => {
+          const val = validateCustomRanking(customRanking);
+          // Build a map: projIdx → "duplicate" | "missing-flag" for tile borders.
+          const dupeProjIdxs = new Set();
+          for (const d of val.duplicates) for (const pi of d.projIdxs) dupeProjIdxs.add(pi);
+          const invalidProjIdxs = new Set(val.invalid);
+          const totalOpp = Math.max(0, totalTeams - 1);
+          const enteredOpp = Object.keys(publicRankings).length;
+          const tooManyKnown = enteredOpp > totalOpp;
+          return (
+            <>
+              {/* status pill */}
+              <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 16, marginBottom: 12, flexWrap: "wrap" }}>
+                {val.valid ? (
+                  <span className="json-status-pill ok"><span className="json-status-dot" />valid permutation</span>
+                ) : (
+                  <>
+                    <span className="json-status-pill err"><span className="json-status-dot" />invalid — fix conflicts below</span>
+                    {val.duplicates.length > 0 && (
+                      <span className="text-fog mono" style={{ fontSize: "0.78rem" }}>
+                        duplicate rank{val.duplicates.length === 1 ? "" : "s"}: {val.duplicates.map(d => d.rank).sort((a, b) => a - b).join(", ")}
+                      </span>
+                    )}
+                    {val.missing.length > 0 && val.missing.length <= 8 && (
+                      <span className="text-fog mono" style={{ fontSize: "0.78rem" }}>
+                        missing rank{val.missing.length === 1 ? "" : "s"}: {val.missing.join(", ")}
+                      </span>
+                    )}
+                    {val.missing.length > 8 && (
+                      <span className="text-fog mono" style={{ fontSize: "0.78rem" }}>
+                        {val.missing.length} ranks missing
+                      </span>
+                    )}
+                  </>
+                )}
+                <button
+                  className="btn btn-primary btn-sm"
+                  style={{ marginLeft: "auto" }}
+                  onClick={runCustomStressTest}
+                  disabled={!val.valid || customLoading || tooManyKnown}
+                  title={!val.valid ? "Fix duplicates/missing ranks first" : tooManyKnown ? "Too many known opponents for current team count" : ""}
+                >
+                  {customLoading ? "Running…" : "Run Stress Test"}
+                </button>
+              </div>
+
+              {/* Tile grid */}
+              <div style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+                gap: 8,
+                marginTop: 8,
+              }}>
+                {projectNames.map((name, projIdx) => {
+                  const r = customRanking[projIdx];
+                  const isDupe = dupeProjIdxs.has(projIdx);
+                  const isInvalid = invalidProjIdxs.has(projIdx);
+                  const isAi = aiProjectIndices.has(projIdx);
+                  return (
+                    <div
+                      key={projIdx}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "8px 10px",
+                        background: "var(--paper)",
+                        border: `1px solid ${isDupe || isInvalid ? "var(--ember)" : "var(--rule)"}`,
+                        borderRadius: 8,
+                        fontSize: "0.85rem",
+                        lineHeight: 1.3,
+                      }}
+                    >
+                      <input
+                        type="number"
+                        min={1}
+                        max={projectNames.length}
+                        value={Number.isInteger(r) && r >= 1 ? r : ""}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          updateCustomRank(projIdx, v === "" ? 0 : Math.max(1, Math.min(projectNames.length, Number(v) || 0)));
+                        }}
+                        style={{
+                          width: 52,
+                          padding: "4px 6px",
+                          fontSize: "0.85rem",
+                          fontFamily: "JetBrains Mono, monospace",
+                          fontWeight: 600,
+                          textAlign: "center",
+                          border: `1px solid ${isDupe || isInvalid ? "var(--ember)" : "var(--rule)"}`,
+                          borderRadius: 4,
+                          background: isDupe || isInvalid ? "rgba(207, 99, 71, 0.08)" : "var(--bone)",
+                          color: isDupe || isInvalid ? "var(--ember)" : "inherit",
+                          flexShrink: 0,
+                        }}
+                      />
+                      <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={name}>
+                        {name}
+                      </span>
+                      {isAi && <span className="ai-badge">AI</span>}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Results */}
+              {customResult && customResult.rows && (
+                <div style={{ marginTop: 24 }}>
+                  <h3 style={{ fontFamily: "Newsreader, serif", margin: "0 0 4px" }}>Custom Ranking Results</h3>
+                  <p className="label" style={{ margin: "0 0 12px" }}>
+                    Your custom ranking vs honest, same three scenarios as the main robustness check.
+                  </p>
+
+                  {/* Top-3 outcome card for custom */}
+                  <div style={{ marginBottom: 16 }}>
+                    <div className="result-card">
+                      <h4>Custom Ranking Outcome</h4>
+                      <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--rule)" }}>
+                        <div style={{ fontSize: "0.7rem", fontWeight: 600, color: "var(--fog)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
+                          Top 3 most likely outcomes (realistic scenarios pooled)
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          {customResult.customTop3.map((entry, i) => (
+                            <div key={i} style={{ display: "grid", gridTemplateColumns: "auto 1fr auto", alignItems: "baseline", gap: 10, fontSize: "0.88rem", lineHeight: 1.35 }}>
+                              <span className="mono" style={{ color: "var(--fog)", fontSize: "0.78rem", minWidth: 14 }}>{i + 1}.</span>
+                              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={projectNames[entry.projIdx]}>
+                                {projectNames[entry.projIdx]}
+                                <span className="mono" style={{ color: "var(--fog)", marginLeft: 8, fontSize: "0.74rem" }}>
+                                  #{entry.truePref + 1}{aiProjectIndices.has(entry.projIdx) ? " · AI" : ""}
+                                </span>
+                              </span>
+                              <span className="mono" style={{ fontWeight: 600, fontSize: "0.88rem", whiteSpace: "nowrap" }}>
+                                {entry.pct.toFixed(0)}%
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                      {customResult.customWorst && (
+                        <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--rule)" }}>
+                          <div style={{ fontSize: "0.7rem", fontWeight: 600, color: "var(--fog)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
+                            Worst outcome under adversarial
+                          </div>
+                          <div style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "baseline", gap: 10, fontSize: "0.88rem", lineHeight: 1.35 }}>
+                            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={projectNames[customResult.customWorst.projIdx]}>
+                              {projectNames[customResult.customWorst.projIdx]}
+                              <span className="mono" style={{ color: "var(--fog)", marginLeft: 8, fontSize: "0.74rem" }}>
+                                #{myTruePref.indexOf(customResult.customWorst.projIdx) + 1}{aiProjectIndices.has(customResult.customWorst.projIdx) ? " · AI" : ""}
+                              </span>
+                            </span>
+                            <span className="mono" style={{ fontWeight: 600, fontSize: "0.88rem" }}>
+                              {customResult.customWorst.pct.toFixed(0)}%
+                            </span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Stress test table */}
+                  <div style={{ overflowX: "auto" }}>
+                    <table className="data-table mono">
+                      <thead>
+                        <tr>
+                          <th>Scenario</th>
+                          <th>Hon AI%</th>
+                          <th>Custom AI%</th>
+                          <th>Custom Wins</th>
+                          <th>Honest Wins</th>
+                          <th>Custom Median</th>
+                          <th>Honest Median</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {customResult.rows.map((row, i) => (
+                          <tr key={i}>
+                            <td style={{ fontFamily: "Inter Tight, sans-serif", verticalAlign: "top", maxWidth: 280 }}>
+                              <div style={{ fontWeight: 600 }}>{row.label}</div>
+                              {row.description && (
+                                <div style={{ fontSize: "0.72rem", color: "var(--fog)", marginTop: 4, lineHeight: 1.4, fontFamily: "Inter Tight, sans-serif", whiteSpace: "normal" }}>
+                                  {row.description}
+                                </div>
+                              )}
+                            </td>
+                            <td style={{ verticalAlign: "top" }}>{row.bAiPct.toFixed(0)}%</td>
+                            <td style={{ verticalAlign: "top" }}>{row.aAiPct.toFixed(0)}%</td>
+                            <td style={{ verticalAlign: "top" }} className={row.aWins > row.bWins ? "text-olive" : ""}>{row.aWins}/{customResult.noiseTrials}</td>
+                            <td style={{ verticalAlign: "top" }} className={row.bWins > row.aWins ? "text-ember" : ""}>{row.bWins}/{customResult.noiseTrials}</td>
+                            <td style={{ verticalAlign: "top" }}>{row.aMedian.toFixed(1)}</td>
+                            <td style={{ verticalAlign: "top" }}>{row.bMedian.toFixed(1)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {customResult && !customResult.rows && customResult.deterministicOutcome && (() => {
+                const det = customResult.deterministicOutcome;
+                const customRank = myTruePref.indexOf(det.customProj) + 1;
+                const honestRank = myTruePref.indexOf(det.honestProj) + 1;
+                const same = det.customProj === det.honestProj;
+                return (
+                  <div style={{ marginTop: 24 }}>
+                    <h3 style={{ fontFamily: "Newsreader, serif", margin: "0 0 4px" }}>Deterministic Outcome</h3>
+                    <p className="label" style={{ margin: "0 0 12px" }}>
+                      All {Object.keys(publicRankings).length} opponent rankings are known. No stress test needed — there's only one possible outcome per ranking.
+                    </p>
+                    <div className="result-grid">
+                      <div className="result-card">
+                        <h4>Custom Ranking Outcome</h4>
+                        <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--rule)", fontSize: "0.95rem", lineHeight: 1.4 }}>
+                          <div style={{ fontWeight: 600 }}>{projectNames[det.customProj]}</div>
+                          <div className="mono" style={{ color: "var(--fog)", fontSize: "0.8rem", marginTop: 4 }}>
+                            your true #{customRank}{aiProjectIndices.has(det.customProj) ? " · AI" : ""}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="result-card">
+                        <h4>Honest Ranking Outcome</h4>
+                        <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--rule)", fontSize: "0.95rem", lineHeight: 1.4 }}>
+                          <div style={{ fontWeight: 600 }}>{projectNames[det.honestProj]}</div>
+                          <div className="mono" style={{ color: "var(--fog)", fontSize: "0.8rem", marginTop: 4 }}>
+                            your true #{honestRank}{aiProjectIndices.has(det.honestProj) ? " · AI" : ""}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ marginTop: 12, padding: "10px 14px", background: "var(--bone)", borderRadius: 8, fontSize: "0.85rem" }}>
+                      {same
+                        ? <>Custom and honest give the <b>same outcome</b>. No advantage either way.</>
+                        : customRank < honestRank
+                          ? <>Custom does <b className="text-olive">better</b> than honest by {honestRank - customRank} preference position{honestRank - customRank === 1 ? "" : "s"}.</>
+                          : <>Custom does <b className="text-ember">worse</b> than honest by {customRank - honestRank} preference position{customRank - honestRank === 1 ? "" : "s"}.</>
+                      }
+                    </div>
+                  </div>
+                );
+              })()}
+            </>
+          );
+        })()}
+      </section>
 
       {importOpen && (
         <div onClick={() => setImportOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(14,17,22,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 20 }}>
