@@ -264,7 +264,7 @@ function stressTestRanking({
     const aOutcomes = [], bOutcomes = [];
     for (let t = 0; t < noiseTrials; t++) {
       const totalOppsThisTrial = knownRankings.length + missingCount;
-      const myRowForTrial = Math.floor(rng.random() * (totalOppsThisTrial + 1));
+      const myRowForTrial = totalOppsThisTrial;
       let opps;
       if (scenario.key === "adversarial") {
         opps = [...knownRankings];
@@ -559,7 +559,7 @@ function robustnessCheck({
     for (let t = 0; t < noiseTrials; t++) {
       let hu, hcu, hp, hcp;
       const totalOppsThisTrial = knownRankings.length + missingCount;
-      const myRowForTrial = Math.floor(rng.random() * (totalOppsThisTrial + 1));
+      const myRowForTrial = totalOppsThisTrial;
 
       if (scenario.key === "adversarial") {
         const advOpps = [...knownRankings];
