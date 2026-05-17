@@ -264,7 +264,10 @@ function stressTestRanking({
     const aOutcomes = [], bOutcomes = [];
     for (let t = 0; t < noiseTrials; t++) {
       const totalOppsThisTrial = knownRankings.length + missingCount;
-      const myRowForTrial = totalOppsThisTrial;
+      // MY_TEAM is always placed at the last row so we lose any row-order
+      // tiebreaks in the Hungarian solve. This is the conservative choice:
+      // any apparent improvement has to survive the worst tiebreaking position.
+      const myRowForTrial = "last";
       let opps;
       if (scenario.key === "adversarial") {
         opps = [...knownRankings];
@@ -490,7 +493,12 @@ function robustnessCheck({
     return { projIdx: worstP, count, total: outcomes.length, pct: (count / outcomes.length) * 100 };
   }
 
-  if (hcScoreClean >= hScoreClean) {
+  // Early-exit is only safe when there are no unknowns (single deterministic
+  // world). When unknowns exist, hScoreClean is from one random fill (seed 42)
+  // while hcScoreClean is an average across the 20 training worlds — not a
+  // valid comparison. Falling through to the stress test gives the user the
+  // real outcome distribution instead of a faked 100% based on one sample.
+  if (hcScoreClean >= hScoreClean && missingCount === 0) {
     const deterministicTop3 = (projIdx) => [{ projIdx, count: 1, total: 1, pct: 100, truePref: myTruePreferences.indexOf(projIdx) }];
     const deterministicWorst = (projIdx) => ({ projIdx, countAdv: 1, totalAdv: 1, pctAdv: 100, countOverall: 1, totalOverall: 1, pctOverall: 100 });
     return {
@@ -507,9 +515,12 @@ function robustnessCheck({
   if (skipNoise) {
     const deterministicTop3 = (projIdx) => [{ projIdx, count: 1, total: 1, pct: 100, truePref: myTruePreferences.indexOf(projIdx) }];
     const deterministicWorst = (projIdx) => ({ projIdx, countAdv: 1, totalAdv: 1, pctAdv: 100, countOverall: 1, totalOverall: 1, pctOverall: 100 });
+    const hcEqualsHonest = JSON.stringify(honestRanking) === JSON.stringify(hcRanking);
     return {
-      verdict: "SAFE", submit: "hc", honestRanking, hcRanking,
-      reason: "Demo mode: HC improves on clean data. Skipped stress trials.",
+      verdict: "SAFE", submit: hcEqualsHonest ? "honest" : "hc", honestRanking, hcRanking,
+      reason: hcEqualsHonest
+        ? "Demo mode: HC produced the same ranking as honest. Skipped stress trials."
+        : "Demo mode: HC improves on clean data. Skipped stress trials.",
       knownCount: knownRankings.length, missingCount, projectNames: projNames,
       noiseResults: null, hProjClean, hcProjClean, noiseTrials, aiSet,
       hWorstCase: deterministicWorst(hProjClean),
@@ -559,7 +570,9 @@ function robustnessCheck({
     for (let t = 0; t < noiseTrials; t++) {
       let hu, hcu, hp, hcp;
       const totalOppsThisTrial = knownRankings.length + missingCount;
-      const myRowForTrial = totalOppsThisTrial;
+      // MY_TEAM is always placed at the last row so we lose any row-order
+      // tiebreaks. Conservative — matches the HC training assumption.
+      const myRowForTrial = "last";
 
       if (scenario.key === "adversarial") {
         const advOpps = [...knownRankings];
@@ -670,9 +683,16 @@ function robustnessCheck({
     return ` Note: in the worst-case scenario where every unknown team converges on your preferences, HC lands you on ${worstName} (your rank #${advRank}) in ${hcWorstCase.pctAdv.toFixed(0)}% of those trials. That scenario is a sidebar, not a typical outcome — but worth being aware of.`;
   }
 
+  const hcEqualsHonest = JSON.stringify(honestRanking) === JSON.stringify(hcRanking);
+
   if (missingCount === 0) {
-    verdict = "SAFE"; submit = "hc";
-    reason = `All ${knownRankings.length} opponent rankings are known. HC outcome is deterministic.`;
+    verdict = "SAFE"; submit = hcEqualsHonest ? "honest" : "hc";
+    reason = hcEqualsHonest
+      ? `All ${knownRankings.length} opponent rankings are known. HC produced the same ranking as honest — outcome is deterministic.`
+      : `All ${knownRankings.length} opponent rankings are known. HC outcome is deterministic.`;
+  } else if (hcEqualsHonest) {
+    verdict = "SAFE"; submit = "honest";
+    reason = `HC produced the same ranking as honest. Stress test shows your honest ranking's actual outcome distribution across the ${missingCount} unknown team${missingCount === 1 ? "" : "s"}.`;
   } else if (neutralOK && clusteredOK) {
     verdict = "SAFE"; submit = "hc";
     reason = `HC survives realistic scenarios. Neutral: ${neutral.hcWins}/${noiseTrials} wins. Clustered: ${clustered.hcWins}/${noiseTrials}.` + buildAdvCaveat();
